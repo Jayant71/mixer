@@ -3,7 +3,7 @@ name = "mixer"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "emd-signal>=1.2",
     "matplotlib>=3.6",
@@ -12,6 +12,17 @@ dependencies = [
     "scikit-learn>=1.2",
     "scipy>=1.10",
     "soundfile>=0.12",
-    "torch>=2.0",
-    "torchvision>=0.15",
+    "torch",
+    "torchvision",
 ]
+
+# Add these sections below to configure the PyTorch CUDA index for uv
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true

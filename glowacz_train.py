@@ -27,6 +27,7 @@ import argparse
 import copy
 import logging
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -38,7 +39,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
 
@@ -77,7 +78,7 @@ ALL_MODELS = ["densenet201", "resnet18", "resnet50", "efficientnet_b0"]
 def get_device(device_str):
     if device_str == "auto":
         if torch.cuda.is_available():
-            return torch.device("cuda")
+            return torch.device("cuda:1")
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
@@ -120,16 +121,11 @@ def get_transforms(augment=False):
     )
 
 
-def split_dataset(targets, train_per_class, seed=42):
-    rng = np.random.RandomState(seed)
-    classes = np.unique(targets)
-    train_idx, test_idx = [], []
-    for cls in classes:
-        cls_idx = np.where(targets == cls)[0]
-        rng.shuffle(cls_idx)
-        n = min(train_per_class, len(cls_idx))
-        train_idx.extend(cls_idx[:n].tolist())
-        test_idx.extend(cls_idx[n:].tolist())
+def split_dataset(targets, test_size=0.2, seed=42):
+    indices = np.arange(len(targets))
+    train_idx, test_idx = train_test_split(
+        indices, test_size=test_size, stratify=targets, random_state=seed
+    )
     return train_idx, test_idx
 
 
@@ -190,17 +186,27 @@ def train_and_evaluate(
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
 
     best_state, best_er = None, 0.0
-    history = {"train_loss": [], "train_acc": [], "test_er": [], "test_mer": []}
+    history = {
+        "train_loss": [],
+        "train_acc": [],
+        "test_loss": [],
+        "test_er": [],
+        "test_mer": [],
+    }
 
     for epoch in range(epochs):
+        start_time = time.time()
         t_loss, t_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
-        _, er, mer, _ = evaluate_model(model, test_loader, criterion, device)
+        v_loss, er, mer, _ = evaluate_model(model, test_loader, criterion, device)
         scheduler.step()
+        epoch_time = time.time() - start_time
+        curr_lr = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(t_loss)
         history["train_acc"].append(t_acc)
+        history["test_loss"].append(v_loss)
         history["test_er"].append(er)
         history["test_mer"].append(mer)
 
@@ -208,17 +214,19 @@ def train_and_evaluate(
             best_er = er
             best_state = copy.deepcopy(model.state_dict())
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            logger.info(
-                "[%s] Epoch %3d/%d  loss=%.4f  acc=%.1f%%  ER=%.1f%%  MER=%.1f%%",
-                model_name,
-                epoch + 1,
-                epochs,
-                t_loss,
-                t_acc,
-                er,
-                mer,
-            )
+        logger.info(
+            "[%s] Epoch %3d/%d | Time: %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | ER: %.1f%% | MER: %.1f%%",
+            model_name,
+            epoch + 1,
+            epochs,
+            epoch_time,
+            curr_lr,
+            t_loss,
+            t_acc,
+            v_loss,
+            er,
+            mer,
+        )
 
     if best_state:
         model.load_state_dict(best_state)
@@ -269,17 +277,23 @@ def run_kfold(
 
 def plot_training_curves(history, model_name, output_path):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(history["train_loss"])
-    axes[0].set_title("Train Loss")
+    axes[0].plot(history["train_loss"], label="Train Loss")
+    if "test_loss" in history:
+        axes[0].plot(history["test_loss"], label="Test Loss")
+    axes[0].set_title("Loss (Error)")
     axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+
     axes[1].plot(history["train_acc"], label="Train Acc")
     axes[1].plot(history["test_er"], label="Test ER")
     axes[1].set_title("Accuracy / ER (%)")
     axes[1].set_xlabel("Epoch")
     axes[1].legend()
+
     axes[2].plot(history["test_mer"])
     axes[2].set_title("Test MER (%)")
     axes[2].set_xlabel("Epoch")
+
     fig.suptitle(model_name)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -465,10 +479,10 @@ def main():
         help="Output directory for models, plots, and results",
     )
     parser.add_argument(
-        "--train_per_class",
-        type=int,
-        default=12,
-        help="Training samples per class (paper default: 12)",
+        "--test_size",
+        type=float,
+        default=0.2,
+        help="Test set size (0.0 to 1.0, default: 0.2 for 80/20 split)",
     )
     parser.add_argument(
         "--epochs", type=int, default=50, help="Training epochs (default: 50)"
@@ -552,7 +566,11 @@ def main():
     np.random.seed(args.seed)
 
     output_dir = Path(args.output_dir)
+    # Each run gets a unique timestamped folder
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = output_dir / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory for this run: %s", output_dir)
 
     # ------------------------------------------------------------------
     # Generate paper figures
@@ -606,12 +624,12 @@ def main():
         class_names,
     )
 
-    train_idx, test_idx = split_dataset(targets, args.train_per_class, args.seed)
+    train_idx, test_idx = split_dataset(targets, args.test_size, args.seed)
     logger.info(
-        "Split: %d train, %d test  (%d per class for train)",
+        "Split: %d train, %d test (%.0f%% test)",
         len(train_idx),
         len(test_idx),
-        args.train_per_class,
+        args.test_size * 100,
     )
 
     train_loader = DataLoader(
@@ -730,7 +748,7 @@ def main():
         fh.write("=" * 50 + "\n\n")
         fh.write(f"Classes ({num_classes}): {class_names}\n")
         fh.write(f"Total images: {len(eval_ds)}\n")
-        fh.write(f"Train/test split: {args.train_per_class} per class for train\n")
+        fh.write(f"Train/test split: {args.test_size*100:.0f}% test (Stratified)\n")
         fh.write(f"  Train: {len(train_idx)}   Test: {len(test_idx)}\n")
         fh.write(
             f"Epochs: {args.epochs}   LR: {args.lr}   Batch: {args.batch_size}\n\n"
@@ -755,6 +773,30 @@ def main():
                 )
 
     logger.info("Summary report saved to %s", report_path)
+
+    # Print final summary block for experiment tracking
+    best_model_name = ""
+    best_er = -1
+    for mn, res in all_results.items():
+        if res["er"] > best_er:
+            best_er = res["er"]
+            best_model_name = mn
+
+    if best_model_name:
+        res = all_results[best_model_name]
+        # Estimate params (very rough or just use a dummy for now if not easy)
+        # For simplicity, we can get it from the model
+        model = create_model(best_model_name, num_classes)
+        num_params = sum(p.numel() for p in model.parameters()) / 1e6
+
+        print("\n---")
+        print(f"val_acc:          {res['er']/100.0:.4f}  (ER)")
+        print(f"mer:              {res['mer']/100.0:.4f}  (MER)")
+        # We don't have total time easily here without wrapping the loop, but we can estimate
+        print(f"num_params_M:     {num_params:.1f}")
+        print(f"best_model:       {best_model_name}")
+        print("---")
+
     logger.info("All done.")
 
 

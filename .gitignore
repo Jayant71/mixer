@@ -13,6 +13,7 @@ wheels/
 output*/
 .ruff_cache
 dataset/
-
+output*/
 *.pdf
 
+training*/
