@@ -407,6 +407,7 @@ def _process_sample(
     word_k=WORD_CODING_K,
     segment_length=SEGMENT_LENGTH,
     target_sr=TARGET_SR,
+    no_resample=False,
 ):
     segments = segment_signal(signal, segment_length)
     seg = segments[0] if segments else np.zeros(segment_length)
