@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, models, transforms
 
@@ -185,7 +185,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
         optimizer.zero_grad()
         use_amp = scaler is not None and device.type == "cuda"
         if use_amp:
-            with autocast():
+            with autocast(device_type="cuda"):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
@@ -240,7 +240,7 @@ def train_and_evaluate(
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
-    scaler = GradScaler() if device.type == "cuda" else None
+    scaler = GradScaler("cuda") if device.type == "cuda" else None
 
     best_state, best_er = None, 0.0
     epochs_no_improve = 0
