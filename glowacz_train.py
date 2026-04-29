@@ -40,6 +40,7 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, models, transforms
 
@@ -83,25 +84,32 @@ ALL_MODELS = ["densenet201", "resnet18", "resnet50", "efficientnet_b0"]
 def get_device(device_str):
     if device_str == "auto":
         if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
             return torch.device("cuda:1")
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
+    if device_str.startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
     return torch.device(device_str)
 
 
-def create_model(model_name, num_classes):
+def create_model(model_name, num_classes, pretrained=True):
     if model_name == "densenet201":
-        model = models.densenet201(weights=models.DenseNet201_Weights.DEFAULT)
+        weights = models.DenseNet201_Weights.DEFAULT if pretrained else None
+        model = models.densenet201(weights=weights)
         model.classifier = nn.Linear(model.classifier.in_features, num_classes)
     elif model_name == "resnet18":
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
     elif model_name == "resnet50":
-        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+        model = models.resnet50(weights=weights)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
     elif model_name == "efficientnet_b0":
-        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        model = models.efficientnet_b0(weights=weights)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -167,7 +175,7 @@ class InMemoryImageDataset(Dataset):
         return img, self.targets[idx]
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -175,10 +183,19 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        use_amp = scaler is not None and device.type == "cuda"
+        if use_amp:
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
         running_loss += loss.item() * images.size(0)
         _, predicted = outputs.max(1)
         total += labels.size(0)
@@ -216,14 +233,17 @@ def evaluate_model(model, loader, criterion, device):
 
 
 def train_and_evaluate(
-    model_name, train_loader, val_loader, num_classes, epochs, lr, device
+    model_name, train_loader, val_loader, num_classes, epochs, lr, device,
+    patience=10, pretrained=True,
 ):
-    model = create_model(model_name, num_classes).to(device)
+    model = create_model(model_name, num_classes, pretrained=pretrained).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+    scaler = GradScaler() if device.type == "cuda" else None
 
     best_state, best_er = None, 0.0
+    epochs_no_improve = 0
     history = {
         "train_loss": [],
         "train_acc": [],
@@ -235,7 +255,7 @@ def train_and_evaluate(
     for epoch in range(epochs):
         start_time = time.time()
         t_loss, t_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, scaler
         )
         v_loss, er, mer, _ = evaluate_model(model, val_loader, criterion, device)
         scheduler.step()
@@ -251,9 +271,12 @@ def train_and_evaluate(
         if er > best_er:
             best_er = er
             best_state = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
         logger.info(
-            "[%s] Epoch %3d/%d | Time: %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | Val ER: %.1f%% | Val MER: %.1f%%",
+            "[%s] Epoch %3d/%d | Time: %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | Val ER: %.1f%% | Val MER: %.1f%% | ES: %d/%d",
             model_name,
             epoch + 1,
             epochs,
@@ -264,7 +287,16 @@ def train_and_evaluate(
             v_loss,
             er,
             mer,
+            epochs_no_improve,
+            patience,
         )
+
+        if epochs_no_improve >= patience:
+            logger.info(
+                "[%s] Early stopping at epoch %d (no improvement for %d epochs, best Val ER: %.1f%%)",
+                model_name, epoch + 1, patience, best_er,
+            )
+            break
 
     if best_state:
         model.load_state_dict(best_state)
@@ -284,6 +316,8 @@ def run_kfold(
     device,
     seed,
     val_fraction=0.15,
+    patience=10,
+    pretrained=True,
 ):
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     fold_results = []
@@ -324,7 +358,8 @@ def run_kfold(
             prefetch_factor=2,
         )
         model, hist = train_and_evaluate(
-            model_name, tr_loader, va_loader, num_classes, epochs, lr, device
+            model_name, tr_loader, va_loader, num_classes, epochs, lr, device,
+            patience=patience, pretrained=pretrained,
         )
         criterion = nn.CrossEntropyLoss()
         _, val_er, val_mer, _ = evaluate_model(model, va_loader, criterion, device)
@@ -816,9 +851,20 @@ def main():
         "--epochs", type=int, default=50, help="Training epochs (default: 50)"
     )
     parser.add_argument(
+        "--no_pretrained",
+        action="store_true",
+        help="Disable pretrained weights (random initialization)",
+    )
+    parser.add_argument(
         "--batch_size", type=int, default=16, help="Batch size (default: 16)"
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=10,
+        help="Early stopping patience in epochs (0 = disabled, default: 10)",
+    )
     parser.add_argument(
         "--models",
         nargs="+",
@@ -1168,6 +1214,8 @@ def main():
             args.epochs,
             args.lr,
             device,
+            patience=args.patience,
+            pretrained=not args.no_pretrained,
         )
 
         torch.save(model.state_dict(), models_dir / f"{model_name}_best.pth")
@@ -1235,6 +1283,8 @@ def main():
                 device,
                 args.seed,
                 val_fraction=args.val_size,
+                patience=args.patience,
+                pretrained=not args.no_pretrained,
             )
 
             test_ers = [f["test_er"] for f in folds]
@@ -1317,7 +1367,7 @@ def main():
 
     if best_model_name:
         res = all_results[best_model_name]
-        model = create_model(best_model_name, num_classes)
+        model = create_model(best_model_name, num_classes, pretrained=not args.no_pretrained)
         num_params = sum(p.numel() for p in model.parameters()) / 1e6
 
         print("\n---")
