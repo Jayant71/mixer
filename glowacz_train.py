@@ -358,7 +358,21 @@ def plot_confusion_matrix(cm, class_names, model_name, output_path):
     plt.close()
 
 
-def _load_one_sample_per_class(dataset_dir):
+def _detect_native_sr(dataset_dir):
+    for class_dir in sorted(dataset_dir.iterdir()):
+        if not class_dir.is_dir() or class_dir.name.startswith("."):
+            continue
+        for f in class_dir.iterdir():
+            if f.suffix.lower() == ".wav" and not f.name.startswith("."):
+                try:
+                    _, sr = load_audio(str(f))
+                    return sr
+                except Exception:
+                    continue
+    return None
+
+
+def _load_one_sample_per_class(dataset_dir, target_sr=TARGET_SR, no_resample=False):
     class_dirs = sorted(
         [d for d in dataset_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
     )
@@ -373,7 +387,10 @@ def _load_one_sample_per_class(dataset_dir):
         )
         if wavs:
             sig, sr = load_audio(str(wavs[0]))
-            sig = resample_signal(sig, sr, TARGET_SR)
+            if no_resample:
+                sig = resample_signal(sig, sr, sr)
+            else:
+                sig = resample_signal(sig, sr, target_sr)
             samples[cd.name] = sig
     return samples
 
@@ -389,14 +406,15 @@ def _process_sample(
     fft_crop_high=FFT_CROP_HIGH,
     word_k=WORD_CODING_K,
     segment_length=SEGMENT_LENGTH,
+    target_sr=TARGET_SR,
 ):
     segments = segment_signal(signal, segment_length)
-    seg = segments[0] if segments else np.zeros(SEGMENT_LENGTH)
-    filtered = pre_filter(seg, filter_low, filter_high, TARGET_SR, order=filter_order)
+    seg = segments[0] if segments else np.zeros(segment_length)
+    filtered = pre_filter(seg, filter_low, filter_high, target_sr, order=filter_order)
     normalized = normalize_amplitude(filtered)
     spectrum = compute_fft_magnitude(normalized)
     cropped, base_freq, freq_res = crop_spectrum(
-        spectrum, fft_crop_low, fft_crop_high, TARGET_SR
+        spectrum, fft_crop_low, fft_crop_high, target_sr
     )
     max_mag = np.max(cropped)
     if max_mag > 0:
@@ -415,6 +433,8 @@ def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LEN
     )
 
     all_word_vectors = defaultdict(list)
+    target_sr = proc_kwargs.pop("target_sr", TARGET_SR)
+    no_resample = proc_kwargs.pop("no_resample", False)
     for class_dir in class_dirs:
         wav_files = sorted(
             [f for f in class_dir.iterdir() if f.suffix.lower() == ".wav" and not f.name.startswith(".")]
@@ -424,11 +444,14 @@ def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LEN
                 signal, sr = load_audio(str(wav_file))
             except Exception:
                 continue
-            signal = resample_signal(signal, sr, TARGET_SR)
+            if no_resample:
+                signal = resample_signal(signal, sr, sr)
+            else:
+                signal = resample_signal(signal, sr, target_sr)
             segments = segment_signal(signal, segment_length)
             for segment in segments:
                 try:
-                    wv, _, _ = process_segment(segment, TARGET_SR, **proc_kwargs)
+                    wv, _, _ = process_segment(segment, target_sr, **proc_kwargs)
                 except Exception:
                     continue
                 all_word_vectors[class_dir.name].append(wv)
@@ -442,7 +465,7 @@ def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LEN
 
     expected = matrix_size * matrix_size
     best_start, best_end, best_sum = find_optimal_range(dwv, expected)
-    freq_resolution = TARGET_SR / segment_length
+    freq_resolution = target_sr / segment_length
     fft_crop_low = proc_kwargs.get("fft_crop_low", FFT_CROP_LOW)
     auto_low = int(fft_crop_low + best_start * freq_resolution)
     auto_high = int(fft_crop_low + best_end * freq_resolution)
@@ -467,6 +490,8 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
 
     all_word_vectors = defaultdict(list)
     segment_registry = []
+    target_sr = proc_kwargs.pop("target_sr", TARGET_SR)
+    no_resample = proc_kwargs.pop("no_resample", False)
 
     for class_dir in class_dirs:
         class_name = class_dir.name
@@ -480,11 +505,14 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
             except Exception as exc:
                 logger.warning("Failed to load %s: %s", wav_file, exc)
                 continue
-            signal = resample_signal(signal, sr, TARGET_SR)
+            if no_resample:
+                signal = resample_signal(signal, sr, sr)
+            else:
+                signal = resample_signal(signal, sr, target_sr)
             segments = segment_signal(signal, segment_length)
             for seg_idx, segment in enumerate(segments):
                 try:
-                    wv, base_freq, freq_res = process_segment(segment, TARGET_SR, **proc_kwargs)
+                    wv, base_freq, freq_res = process_segment(segment, target_sr, **proc_kwargs)
                 except Exception as exc:
                     logger.warning("Failed on segment %d of %s: %s", seg_idx, wav_file.name, exc)
                     continue
@@ -511,12 +539,12 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
     return True
 
 
-def plot_time_domain(dataset_dir, output_path):
-    samples = _load_one_sample_per_class(dataset_dir)
+def plot_time_domain(dataset_dir, output_path, target_sr=TARGET_SR, no_resample=False):
+    samples = _load_one_sample_per_class(dataset_dir, target_sr=target_sr, no_resample=no_resample)
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for ax, (cls, sig) in zip(axes.flat, samples.items()):
-        t = np.arange(len(sig)) / TARGET_SR
+        t = np.arange(len(sig)) / target_sr
         axes_flat = axes.flatten()
         idx = list(samples.keys()).index(cls)
         axes_flat[idx].plot(t, sig, linewidth=0.3, color="steelblue")
@@ -531,7 +559,9 @@ def plot_time_domain(dataset_dir, output_path):
 
 
 def plot_fft_spectra(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_crop_high=FFT_CROP_HIGH, **proc_kwargs):
-    samples = _load_one_sample_per_class(dataset_dir)
+    target_sr = proc_kwargs.get("target_sr", TARGET_SR)
+    no_resample = proc_kwargs.get("no_resample", False)
+    samples = _load_one_sample_per_class(dataset_dir, target_sr=target_sr, no_resample=no_resample)
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for idx, (cls, sig) in enumerate(samples.items()):
@@ -551,16 +581,18 @@ def plot_fft_spectra(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_cr
 
 
 def plot_fft_full_audio(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_crop_high=FFT_CROP_HIGH, **proc_kwargs):
-    samples = _load_one_sample_per_class(dataset_dir)
+    target_sr = proc_kwargs.get("target_sr", TARGET_SR)
+    no_resample = proc_kwargs.get("no_resample", False)
+    samples = _load_one_sample_per_class(dataset_dir, target_sr=target_sr, no_resample=no_resample)
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for idx, (cls, sig) in enumerate(samples.items()):
         filter_high = proc_kwargs.get("filter_high", BANDPASS_HIGH)
         filter_order = proc_kwargs.get("filter_order", 5)
-        filtered = pre_filter(sig, proc_kwargs.get("filter_low", BANDPASS_LOW), filter_high, TARGET_SR, order=filter_order)
+        filtered = pre_filter(sig, proc_kwargs.get("filter_low", BANDPASS_LOW), filter_high, target_sr, order=filter_order)
         normalized = normalize_amplitude(filtered)
         spectrum = compute_fft_magnitude(normalized)
-        cropped, base_freq, freq_res = crop_spectrum(spectrum, fft_crop_low, fft_crop_high, TARGET_SR)
+        cropped, base_freq, freq_res = crop_spectrum(spectrum, fft_crop_low, fft_crop_high, target_sr)
         freqs = np.arange(len(cropped)) * freq_res + base_freq
         axes[idx, 0].plot(freqs, cropped, linewidth=0.5, color="steelblue")
         axes[idx, 0].set_title(cls, fontsize=10)
@@ -763,9 +795,30 @@ def main():
         default=PAPER_DWV_HIGH,
         help="DWV frequency range upper bound in Hz (paper: 807)",
     )
+    parser.add_argument(
+        "--target_sr",
+        type=int,
+        default=TARGET_SR,
+        help="Target sample rate in Hz for resampling (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no_resample",
+        action="store_true",
+        help="Do not resample audio; use native sample rate of each file. "
+             "Overrides --target_sr with the first file's native SR.",
+    )
     args = parser.parse_args()
 
-    segment_length = int(TARGET_SR * args.segment_duration)
+    target_sr = args.target_sr
+    if args.no_resample:
+        detected_sr = _detect_native_sr(Path(args.dataset_dir))
+        if detected_sr is not None:
+            target_sr = detected_sr
+            logger.info("--no_resample: using native sample rate %d Hz", target_sr)
+        else:
+            logger.warning("--no_resample but no WAV files found; using --target_sr %d", target_sr)
+
+    segment_length = int(target_sr * args.segment_duration)
 
     proc_kwargs = dict(
         filter_low=args.filter_low,
@@ -775,6 +828,8 @@ def main():
         fft_crop_high=args.fft_crop_high,
         word_k=args.word_k,
         segment_length=segment_length,
+        target_sr=target_sr,
+        no_resample=args.no_resample,
     )
 
     if args.auto_range:
@@ -804,7 +859,8 @@ def main():
 
     logger.info("Using DWV range: %d–%d Hz", dwv_low, dwv_high)
     logger.info(
-        "Parameters: filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
+        "Parameters: target_sr=%d Hz, resample=%s, filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
+        target_sr, not args.no_resample,
         args.filter_low, args.filter_high, args.filter_order,
         args.fft_crop_low, args.fft_crop_high, args.word_k,
         args.matrix_size, args.matrix_size, args.segment_duration,
@@ -829,7 +885,8 @@ def main():
         dataset_dir = Path(args.dataset_dir)
 
         logger.info("Generating paper figures...")
-        plot_time_domain(dataset_dir, plots_dir / "01_time_domain_signals.png")
+        plot_time_domain(dataset_dir, plots_dir / "01_time_domain_signals.png",
+                         target_sr=target_sr, no_resample=args.no_resample)
         logger.info("  Saved time-domain signals")
         plot_fft_spectra(
             dataset_dir, plots_dir / "02_fft_spectra.png",

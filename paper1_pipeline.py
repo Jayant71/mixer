@@ -326,6 +326,18 @@ def main():
         action="store_true",
         help="Also save images as .npz arrays for training",
     )
+    parser.add_argument(
+        "--target_sr",
+        type=int,
+        default=TARGET_SR,
+        help="Target sample rate in Hz for resampling (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no_resample",
+        action="store_true",
+        help="Do not resample audio; use native sample rate of each file. "
+             "Overrides --target_sr with the first file's native SR.",
+    )
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
@@ -344,8 +356,26 @@ def main():
         sys.exit(1)
 
     logger.info("Found %d classes: %s", len(class_dirs), [d.name for d in class_dirs])
-    segment_length = int(TARGET_SR * args.segment_duration)
-    logger.info("Parameters: filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
+
+    target_sr = args.target_sr
+    if args.no_resample:
+        detected_sr = None
+        for class_dir in class_dirs:
+            for f in class_dir.iterdir():
+                if f.suffix.lower() == ".wav" and not f.name.startswith("."):
+                    _, detected_sr = load_audio(str(f))
+                    break
+            if detected_sr is not None:
+                break
+        if detected_sr is not None:
+            target_sr = detected_sr
+            logger.info("--no_resample: using native sample rate %d Hz", target_sr)
+        else:
+            logger.warning("--no_resample but no WAV files found; using --target_sr %d", target_sr)
+
+    segment_length = int(target_sr * args.segment_duration)
+    logger.info("Parameters: target_sr=%d Hz, resample=%s, filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
+                target_sr, not args.no_resample,
                 args.filter_low, args.filter_high, args.filter_order,
                 args.fft_crop_low, args.fft_crop_high, args.word_k,
                 args.matrix_size, args.matrix_size, args.segment_duration)
@@ -378,14 +408,17 @@ def main():
                 logger.warning("Failed to load %s: %s", wav_file, exc)
                 continue
 
-            signal = resample_signal(signal, sr, TARGET_SR)
+            if args.no_resample:
+                signal = resample_signal(signal, sr, sr)
+            else:
+                signal = resample_signal(signal, sr, target_sr)
             segments = segment_signal(signal, segment_length)
 
             for seg_idx, segment in enumerate(segments):
                 try:
                     wv, base_freq, freq_res = process_segment(
                         segment,
-                        TARGET_SR,
+                        target_sr,
                         filter_low=args.filter_low,
                         filter_high=args.filter_high,
                         filter_order=args.filter_order,
@@ -431,7 +464,7 @@ def main():
 
         expected_components = args.matrix_size * args.matrix_size
         best_start, best_end, best_sum = find_optimal_range(dwv, expected_components)
-        freq_resolution = TARGET_SR / segment_length
+        freq_resolution = target_sr / segment_length
         auto_low = int(args.fft_crop_low + best_start * freq_resolution)
         auto_high = int(args.fft_crop_low + best_end * freq_resolution)
         logger.info(
