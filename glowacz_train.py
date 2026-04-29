@@ -5,7 +5,7 @@ Glowacz et al. Full Replication: CNN Training, Evaluation & Paper Figures
 Replicates the acoustic fault diagnosis pipeline end-to-end:
   - Train DenseNet-201, ResNet-18, ResNet-50, EfficientNet-B0 on 224x224x3
     acoustic images produced by paper1_pipeline.py.
-  - Evaluate with ER (overall accuracy) and MER (mean per-class accuracy).
+  - Evaluate with Accuracy (overall) and Balanced Accuracy (mean per-class).
   - Stratified K-fold cross-validation.
   - Generate all four paper figures:
       1. Time-domain waveforms per class
@@ -38,7 +38,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score
+from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -175,13 +176,16 @@ class InMemoryImageDataset(Dataset):
         return img, self.targets[idx]
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, epoch=None, num_epochs=None):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
+    desc = f"Epoch {epoch}/{num_epochs}" if epoch else "Training"
+    pbar = tqdm(loader, desc=desc, leave=False, unit="batch",
+                bar_format="{l_bar}{bar:20}{r_bar}")
+    for images, labels in pbar:
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         optimizer.zero_grad()
         use_amp = scaler is not None and device.type == "cuda"
         if use_amp:
@@ -200,16 +204,21 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-    return running_loss / max(total, 1), 100.0 * correct / max(total, 1)
+        avg_loss = running_loss / max(total, 1)
+        acc = 100.0 * correct / max(total, 1)
+        pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{acc:.1f}%")
+    return avg_loss, acc
 
 
-def evaluate_model(model, loader, criterion, device):
+def evaluate_model(model, loader, criterion, device, desc="Eval"):
     model.eval()
     running_loss = 0.0
     all_preds, all_labels = [], []
+    pbar = tqdm(loader, desc=desc, leave=False, unit="batch",
+                bar_format="{l_bar}{bar:20}{r_bar}")
     with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
+        for images, labels in pbar:
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             outputs = model(images)
             running_loss += criterion(outputs, labels).item() * images.size(0)
             all_preds.extend(outputs.max(1)[1].cpu().numpy())
@@ -219,17 +228,11 @@ def evaluate_model(model, loader, criterion, device):
     labels = np.array(all_labels)
     n_classes = len(set(labels))
 
-    er = 100.0 * np.sum(preds == labels) / max(len(labels), 1)
-
-    per_class = []
-    for c in range(n_classes):
-        mask = labels == c
-        if mask.sum() > 0:
-            per_class.append(100.0 * np.sum(preds[mask] == c) / mask.sum())
-    mer = float(np.mean(per_class)) if per_class else 0.0
+    accuracy = 100.0 * np.sum(preds == labels) / max(len(labels), 1)
+    balanced_acc = 100.0 * balanced_accuracy_score(labels, preds)
 
     cm = confusion_matrix(labels, preds, labels=list(range(n_classes)))
-    return running_loss / max(len(labels), 1), er, mer, cm
+    return running_loss / max(len(labels), 1), accuracy, balanced_acc, cm
 
 
 def train_and_evaluate(
@@ -242,22 +245,25 @@ def train_and_evaluate(
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
     scaler = GradScaler("cuda") if device.type == "cuda" else None
 
-    best_state, best_er = None, 0.0
+    best_state, best_acc = None, 0.0
     epochs_no_improve = 0
     history = {
         "train_loss": [],
         "train_acc": [],
         "val_loss": [],
-        "val_er": [],
-        "val_mer": [],
+        "val_accuracy": [],
+        "val_balanced_acc": [],
     }
 
     for epoch in range(epochs):
         start_time = time.time()
         t_loss, t_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler
+            model, train_loader, criterion, optimizer, device, scaler,
+            epoch=epoch + 1, num_epochs=epochs,
         )
-        v_loss, er, mer, _ = evaluate_model(model, val_loader, criterion, device)
+        v_loss, accuracy, balanced_acc, _ = evaluate_model(
+            model, val_loader, criterion, device, desc=f"Epoch {epoch+1} val",
+        )
         scheduler.step()
         epoch_time = time.time() - start_time
         curr_lr = optimizer.param_groups[0]["lr"]
@@ -265,18 +271,18 @@ def train_and_evaluate(
         history["train_loss"].append(t_loss)
         history["train_acc"].append(t_acc)
         history["val_loss"].append(v_loss)
-        history["val_er"].append(er)
-        history["val_mer"].append(mer)
+        history["val_accuracy"].append(accuracy)
+        history["val_balanced_acc"].append(balanced_acc)
 
-        if er > best_er:
-            best_er = er
+        if accuracy > best_acc:
+            best_acc = accuracy
             best_state = copy.deepcopy(model.state_dict())
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
 
         logger.info(
-            "[%s] Epoch %3d/%d | Time: %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | Val ER: %.1f%% | Val MER: %.1f%% | ES: %d/%d",
+            "[%s] Epoch %3d/%d | %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | Val Acc: %.1f%% | Val Bal.Acc: %.1f%% | ES: %d/%d",
             model_name,
             epoch + 1,
             epochs,
@@ -285,16 +291,16 @@ def train_and_evaluate(
             t_loss,
             t_acc,
             v_loss,
-            er,
-            mer,
+            accuracy,
+            balanced_acc,
             epochs_no_improve,
             patience,
         )
 
         if epochs_no_improve >= patience:
             logger.info(
-                "[%s] Early stopping at epoch %d (no improvement for %d epochs, best Val ER: %.1f%%)",
-                model_name, epoch + 1, patience, best_er,
+                "[%s] Early stopping at epoch %d (no improvement for %d epochs, best Val Acc: %.1f%%)",
+                model_name, epoch + 1, patience, best_acc,
             )
             break
 
@@ -362,23 +368,23 @@ def run_kfold(
             patience=patience, pretrained=pretrained,
         )
         criterion = nn.CrossEntropyLoss()
-        _, val_er, val_mer, _ = evaluate_model(model, va_loader, criterion, device)
-        _, test_er, test_mer, cm = evaluate_model(model, te_loader, criterion, device)
+        _, val_acc, val_ba, _ = evaluate_model(model, va_loader, criterion, device, desc=f"Fold {fold+1} val")
+        _, test_acc, test_ba, cm = evaluate_model(model, te_loader, criterion, device, desc=f"Fold {fold+1} test")
         fold_results.append(
             {
-                "val_er": val_er,
-                "val_mer": val_mer,
-                "test_er": test_er,
-                "test_mer": test_mer,
+                "val_accuracy": val_acc,
+                "val_balanced_acc": val_ba,
+                "test_accuracy": test_acc,
+                "test_balanced_acc": test_ba,
                 "cm": cm,
                 "history": hist,
             }
         )
         logger.info(
-            "    Fold %d: Val ER=%.1f%%  Test ER=%.1f%%",
+            "    Fold %d: Val Acc=%.1f%%  Test Acc=%.1f%%",
             fold + 1,
-            val_er,
-            test_er,
+            val_acc,
+            test_acc,
         )
 
     return fold_results
@@ -394,13 +400,13 @@ def plot_training_curves(history, model_name, output_path):
     axes[0].legend()
 
     axes[1].plot(history["train_acc"], label="Train Acc")
-    axes[1].plot(history["val_er"], label="Val ER")
-    axes[1].set_title("Accuracy / Val ER (%)")
+    axes[1].plot(history["val_accuracy"], label="Val Acc")
+    axes[1].set_title("Accuracy (%)")
     axes[1].set_xlabel("Epoch")
     axes[1].legend()
 
-    axes[2].plot(history["val_mer"])
-    axes[2].set_title("Val MER (%)")
+    axes[2].plot(history["val_balanced_acc"])
+    axes[2].set_title("Val Balanced Acc (%)")
     axes[2].set_xlabel("Epoch")
 
     fig.suptitle(model_name)
@@ -1228,9 +1234,9 @@ def main():
         )
 
         criterion = nn.CrossEntropyLoss()
-        _, val_er, val_mer, _ = evaluate_model(model, val_loader, criterion, device)
-        _, test_er, test_mer, test_cm = evaluate_model(
-            model, test_loader, criterion, device
+        _, val_acc, val_ba, _ = evaluate_model(model, val_loader, criterion, device, desc="Val")
+        _, test_acc, test_ba, test_cm = evaluate_model(
+            model, test_loader, criterion, device, desc="Test"
         )
         plot_confusion_matrix(
             test_cm,
@@ -1240,21 +1246,21 @@ def main():
         )
 
         all_results[model_name] = {
-            "val_er": val_er,
-            "val_mer": val_mer,
-            "test_er": test_er,
-            "test_mer": test_mer,
+            "val_accuracy": val_acc,
+            "val_balanced_acc": val_ba,
+            "test_accuracy": test_acc,
+            "test_balanced_acc": test_ba,
             "cm": test_cm,
             "history": history,
         }
 
         logger.info(
-            "[%s] Final — Val ER: %.1f%%  Val MER: %.1f%%  |  Test ER: %.1f%%  Test MER: %.1f%%",
+            "[%s] Final — Val Acc: %.1f%%  Val Bal.Acc: %.1f%%  |  Test Acc: %.1f%%  Test Bal.Acc: %.1f%%",
             model_name,
-            val_er,
-            val_mer,
-            test_er,
-            test_mer,
+            val_acc,
+            val_ba,
+            test_acc,
+            test_ba,
         )
 
     # ------------------------------------------------------------------
@@ -1287,33 +1293,33 @@ def main():
                 pretrained=not args.no_pretrained,
             )
 
-            test_ers = [f["test_er"] for f in folds]
-            test_mers = [f["test_mer"] for f in folds]
-            val_ers = [f["val_er"] for f in folds]
-            val_mers = [f["val_mer"] for f in folds]
+            test_accs = [f["test_accuracy"] for f in folds]
+            test_bas = [f["test_balanced_acc"] for f in folds]
+            val_accs = [f["val_accuracy"] for f in folds]
+            val_bas = [f["val_balanced_acc"] for f in folds]
             kfold_results[model_name] = {
-                "test_ers": test_ers,
-                "test_mers": test_mers,
-                "val_ers": val_ers,
-                "val_mers": val_mers,
+                "test_accs": test_accs,
+                "test_bas": test_bas,
+                "val_accs": val_accs,
+                "val_bas": val_bas,
                 "folds": folds,
             }
 
             logger.info(
-                "[%s] K-fold  Val ER: %.1f ± %.1f%%  |  Test ER: %.1f ± %.1f%%",
+                "[%s] K-fold  Val Acc: %.1f ± %.1f%%  |  Test Acc: %.1f ± %.1f%%",
                 model_name,
-                np.mean(val_ers),
-                np.std(val_ers),
-                np.mean(test_ers),
-                np.std(test_ers),
+                np.mean(val_accs),
+                np.std(val_accs),
+                np.mean(test_accs),
+                np.std(test_accs),
             )
 
             np.savez(
                 kf_dir / f"{model_name}_kfold.npz",
-                test_ers=np.array(test_ers),
-                test_mers=np.array(test_mers),
-                val_ers=np.array(val_ers),
-                val_mers=np.array(val_mers),
+                test_accs=np.array(test_accs),
+                test_bas=np.array(test_bas),
+                val_accs=np.array(val_accs),
+                val_bas=np.array(val_bas),
             )
 
     # ------------------------------------------------------------------
@@ -1341,8 +1347,8 @@ def main():
         for mn in args.models:
             r = all_results[mn]
             fh.write(
-                f"  {mn:20s}  Val ER = {r['val_er']:5.1f}%  Val MER = {r['val_mer']:5.1f}%"
-                f"  |  Test ER = {r['test_er']:5.1f}%  Test MER = {r['test_mer']:5.1f}%\n"
+                f"  {mn:20s}  Val Acc = {r['val_accuracy']:5.1f}%  Val Bal.Acc = {r['val_balanced_acc']:5.1f}%"
+                f"  |  Test Acc = {r['test_accuracy']:5.1f}%  Test Bal.Acc = {r['test_balanced_acc']:5.1f}%\n"
             )
 
         if kfold_results:
@@ -1352,17 +1358,17 @@ def main():
             for mn in args.models:
                 kr = kfold_results[mn]
                 fh.write(
-                    f"  {mn:20s}  Val ER = {np.mean(kr['val_ers']):5.1f} ± {np.std(kr['val_ers']):4.1f}%"
-                    f"  |  Test ER = {np.mean(kr['test_ers']):5.1f} ± {np.std(kr['test_ers']):4.1f}%\n"
+                    f"  {mn:20s}  Val Acc = {np.mean(kr['val_accs']):5.1f} ± {np.std(kr['val_accs']):4.1f}%"
+                    f"  |  Test Acc = {np.mean(kr['test_accs']):5.1f} ± {np.std(kr['test_accs']):4.1f}%\n"
                 )
 
     logger.info("Summary report saved to %s", report_path)
 
     best_model_name = ""
-    best_test_er = -1
+    best_test_acc = -1
     for mn, res in all_results.items():
-        if res["test_er"] > best_test_er:
-            best_test_er = res["test_er"]
+        if res["test_accuracy"] > best_test_acc:
+            best_test_acc = res["test_accuracy"]
             best_model_name = mn
 
     if best_model_name:
@@ -1371,10 +1377,10 @@ def main():
         num_params = sum(p.numel() for p in model.parameters()) / 1e6
 
         print("\n---")
-        print(f"val_acc:          {res['val_er'] / 100.0:.4f}  (Val ER)")
-        print(f"val_mer:          {res['val_mer'] / 100.0:.4f}  (Val MER)")
-        print(f"test_acc:         {res['test_er'] / 100.0:.4f}  (Test ER)")
-        print(f"test_mer:         {res['test_mer'] / 100.0:.4f}  (Test MER)")
+        print(f"val_acc:          {res['val_accuracy'] / 100.0:.4f}  (Val Accuracy)")
+        print(f"val_balanced_acc: {res['val_balanced_acc'] / 100.0:.4f}  (Val Balanced Accuracy)")
+        print(f"test_acc:         {res['test_accuracy'] / 100.0:.4f}  (Test Accuracy)")
+        print(f"test_balanced_acc:{res['test_balanced_acc'] / 100.0:.4f}  (Test Balanced Accuracy)")
         print(f"num_params_M:     {num_params:.1f}")
         print(f"best_model:       {best_model_name}")
         print("---")
