@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, models, transforms
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -134,9 +134,37 @@ def split_dataset(targets, test_size=0.15, val_size=0.15, seed=42):
     train_val_targets = targets[train_val_idx]
     val_fraction = val_size / (1.0 - test_size)
     train_idx, val_idx = train_test_split(
-        train_val_idx, test_size=val_fraction, stratify=train_val_targets, random_state=seed
+        train_val_idx,
+        test_size=val_fraction,
+        stratify=train_val_targets,
+        random_state=seed,
     )
     return train_idx, val_idx, test_idx
+
+
+class InMemoryImageDataset(Dataset):
+    def __init__(self, image_folder_dataset, transform=None):
+        self.transform = transform
+        self.samples = []
+        self.targets = []
+        self.classes = image_folder_dataset.classes
+        self.class_to_idx = image_folder_dataset.class_to_idx
+        logger.info("Pre-loading %d images into RAM...", len(image_folder_dataset))
+        for i, (img, label) in enumerate(image_folder_dataset):
+            self.samples.append(img)
+            self.targets.append(label)
+            if (i + 1) % 500 == 0:
+                logger.info("  Loaded %d / %d", i + 1, len(image_folder_dataset))
+        logger.info("All %d images loaded into RAM", len(self.samples))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img = self.samples[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, self.targets[idx]
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -260,30 +288,40 @@ def run_kfold(
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     fold_results = []
 
-    for fold, (train_val_idx, te_idx) in enumerate(skf.split(np.zeros(len(targets)), targets)):
+    for fold, (train_val_idx, te_idx) in enumerate(
+        skf.split(np.zeros(len(targets)), targets)
+    ):
         logger.info("  [%s] Fold %d/%d", model_name, fold + 1, k)
         train_val_targets = targets[train_val_idx]
         tr_idx, va_idx = train_test_split(
-            train_val_idx, test_size=val_fraction,
-            stratify=train_val_targets, random_state=seed,
+            train_val_idx,
+            test_size=val_fraction,
+            stratify=train_val_targets,
+            random_state=seed,
         )
         tr_loader = DataLoader(
             Subset(train_ds, tr_idx.tolist()),
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=16,
+            pin_memory=True,
+            prefetch_factor=2,
         )
         va_loader = DataLoader(
             Subset(eval_ds, va_idx.tolist()),
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=16,
+            pin_memory=True,
+            prefetch_factor=2,
         )
         te_loader = DataLoader(
             Subset(eval_ds, te_idx.tolist()),
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=16,
+            pin_memory=True,
+            prefetch_factor=2,
         )
         model, hist = train_and_evaluate(
             model_name, tr_loader, va_loader, num_classes, epochs, lr, device
@@ -291,13 +329,21 @@ def run_kfold(
         criterion = nn.CrossEntropyLoss()
         _, val_er, val_mer, _ = evaluate_model(model, va_loader, criterion, device)
         _, test_er, test_mer, cm = evaluate_model(model, te_loader, criterion, device)
-        fold_results.append({
-            "val_er": val_er, "val_mer": val_mer,
-            "test_er": test_er, "test_mer": test_mer,
-            "cm": cm, "history": hist,
-        })
+        fold_results.append(
+            {
+                "val_er": val_er,
+                "val_mer": val_mer,
+                "test_er": test_er,
+                "test_mer": test_mer,
+                "cm": cm,
+                "history": hist,
+            }
+        )
         logger.info(
-            "    Fold %d: Val ER=%.1f%%  Test ER=%.1f%%", fold + 1, val_er, test_er,
+            "    Fold %d: Val ER=%.1f%%  Test ER=%.1f%%",
+            fold + 1,
+            val_er,
+            test_er,
         )
 
     return fold_results
@@ -425,7 +471,9 @@ def _process_sample(
     return seg, cropped, base_freq, freq_res, word_slice
 
 
-def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LENGTH, **proc_kwargs):
+def _compute_auto_dwv_range(
+    dataset_dir, matrix_size, segment_length=SEGMENT_LENGTH, **proc_kwargs
+):
     from collections import defaultdict
 
     dataset_path = Path(dataset_dir)
@@ -438,7 +486,11 @@ def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LEN
     no_resample = proc_kwargs.pop("no_resample", False)
     for class_dir in class_dirs:
         wav_files = sorted(
-            [f for f in class_dir.iterdir() if f.suffix.lower() == ".wav" and not f.name.startswith(".")]
+            [
+                f
+                for f in class_dir.iterdir()
+                if f.suffix.lower() == ".wav" and not f.name.startswith(".")
+            ]
         )
         for wav_file in wav_files:
             try:
@@ -473,12 +525,23 @@ def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LEN
 
     logger.info(
         "Auto-detected DWV range from dataset: %d-%d Hz (sum=%.4f)",
-        auto_low, auto_high, best_sum,
+        auto_low,
+        auto_high,
+        best_sum,
     )
     return auto_low, auto_high
 
 
-def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output_size, segment_length=SEGMENT_LENGTH, **proc_kwargs):
+def _run_pipeline(
+    image_dir,
+    dataset_dir,
+    dwv_low,
+    dwv_high,
+    matrix_size,
+    output_size,
+    segment_length=SEGMENT_LENGTH,
+    **proc_kwargs,
+):
     from collections import defaultdict
 
     dataset_path = Path(dataset_dir)
@@ -497,7 +560,11 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
     for class_dir in class_dirs:
         class_name = class_dir.name
         wav_files = sorted(
-            [f for f in class_dir.iterdir() if f.suffix.lower() == ".wav" and not f.name.startswith(".")]
+            [
+                f
+                for f in class_dir.iterdir()
+                if f.suffix.lower() == ".wav" and not f.name.startswith(".")
+            ]
         )
         logger.info("  Processing class '%s': %d WAV files", class_name, len(wav_files))
         for wav_file in wav_files:
@@ -513,12 +580,18 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
             segments = segment_signal(signal, segment_length)
             for seg_idx, segment in enumerate(segments):
                 try:
-                    wv, base_freq, freq_res = process_segment(segment, target_sr, **proc_kwargs)
+                    wv, base_freq, freq_res = process_segment(
+                        segment, target_sr, **proc_kwargs
+                    )
                 except Exception as exc:
-                    logger.warning("Failed on segment %d of %s: %s", seg_idx, wav_file.name, exc)
+                    logger.warning(
+                        "Failed on segment %d of %s: %s", seg_idx, wav_file.name, exc
+                    )
                     continue
                 all_word_vectors[class_name].append(wv)
-                segment_registry.append((class_name, wav_file, seg_idx, wv, base_freq, freq_res))
+                segment_registry.append(
+                    (class_name, wav_file, seg_idx, wv, base_freq, freq_res)
+                )
 
     if not segment_registry:
         logger.error("No segments generated from dataset")
@@ -529,7 +602,9 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
     for entry in segment_registry:
         class_name, source_file, seg_idx, wv, base_freq, freq_res = entry
         word_slice = extract_dwv_range(wv, base_freq, freq_res, dwv_low, dwv_high)
-        acoustic_img = create_acoustic_image(word_slice, matrix_size=matrix_size, output_size=output_size)
+        acoustic_img = create_acoustic_image(
+            word_slice, matrix_size=matrix_size, output_size=output_size
+        )
         class_img_dir = images_path / class_name
         class_img_dir.mkdir(parents=True, exist_ok=True)
         img_filename = f"{source_file.stem}_seg{seg_idx:03d}.png"
@@ -541,7 +616,9 @@ def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output
 
 
 def plot_time_domain(dataset_dir, output_path, target_sr=TARGET_SR, no_resample=False):
-    samples = _load_one_sample_per_class(dataset_dir, target_sr=target_sr, no_resample=no_resample)
+    samples = _load_one_sample_per_class(
+        dataset_dir, target_sr=target_sr, no_resample=no_resample
+    )
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for ax, (cls, sig) in zip(axes.flat, samples.items()):
@@ -559,14 +636,24 @@ def plot_time_domain(dataset_dir, output_path, target_sr=TARGET_SR, no_resample=
     plt.close()
 
 
-def plot_fft_spectra(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_crop_high=FFT_CROP_HIGH, **proc_kwargs):
+def plot_fft_spectra(
+    dataset_dir,
+    output_path,
+    fft_crop_low=FFT_CROP_LOW,
+    fft_crop_high=FFT_CROP_HIGH,
+    **proc_kwargs,
+):
     target_sr = proc_kwargs.get("target_sr", TARGET_SR)
     no_resample = proc_kwargs.get("no_resample", False)
-    samples = _load_one_sample_per_class(dataset_dir, target_sr=target_sr, no_resample=no_resample)
+    samples = _load_one_sample_per_class(
+        dataset_dir, target_sr=target_sr, no_resample=no_resample
+    )
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for idx, (cls, sig) in enumerate(samples.items()):
-        _, cropped, base_freq, freq_res, _ = _process_sample(sig, fft_crop_low=fft_crop_low, fft_crop_high=fft_crop_high, **proc_kwargs)
+        _, cropped, base_freq, freq_res, _ = _process_sample(
+            sig, fft_crop_low=fft_crop_low, fft_crop_high=fft_crop_high, **proc_kwargs
+        )
         freqs = np.arange(len(cropped)) * freq_res + base_freq
         axes[idx, 0].bar(freqs, cropped, width=freq_res, align="center")
         axes[idx, 0].set_title(cls, fontsize=10)
@@ -575,25 +662,43 @@ def plot_fft_spectra(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_cr
         axes[idx, 0].set_xlim(fft_crop_low, fft_crop_high)
         axes[idx, 0].set_ylim(bottom=0)
         axes[idx, 0].grid(True, alpha=0.3)
-    plt.suptitle(f"FFT Spectra ({fft_crop_low}–{fft_crop_high} Hz)", fontsize=13, y=1.01)
+    plt.suptitle(
+        f"FFT Spectra ({fft_crop_low}–{fft_crop_high} Hz)", fontsize=13, y=1.01
+    )
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def plot_fft_full_audio(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_crop_high=FFT_CROP_HIGH, **proc_kwargs):
+def plot_fft_full_audio(
+    dataset_dir,
+    output_path,
+    fft_crop_low=FFT_CROP_LOW,
+    fft_crop_high=FFT_CROP_HIGH,
+    **proc_kwargs,
+):
     target_sr = proc_kwargs.get("target_sr", TARGET_SR)
     no_resample = proc_kwargs.get("no_resample", False)
-    samples = _load_one_sample_per_class(dataset_dir, target_sr=target_sr, no_resample=no_resample)
+    samples = _load_one_sample_per_class(
+        dataset_dir, target_sr=target_sr, no_resample=no_resample
+    )
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for idx, (cls, sig) in enumerate(samples.items()):
         filter_high = proc_kwargs.get("filter_high", BANDPASS_HIGH)
         filter_order = proc_kwargs.get("filter_order", 5)
-        filtered = pre_filter(sig, proc_kwargs.get("filter_low", BANDPASS_LOW), filter_high, target_sr, order=filter_order)
+        filtered = pre_filter(
+            sig,
+            proc_kwargs.get("filter_low", BANDPASS_LOW),
+            filter_high,
+            target_sr,
+            order=filter_order,
+        )
         normalized = normalize_amplitude(filtered)
         spectrum = compute_fft_magnitude(normalized)
-        cropped, base_freq, freq_res = crop_spectrum(spectrum, fft_crop_low, fft_crop_high, target_sr)
+        cropped, base_freq, freq_res = crop_spectrum(
+            spectrum, fft_crop_low, fft_crop_high, target_sr
+        )
         freqs = np.arange(len(cropped)) * freq_res + base_freq
         axes[idx, 0].plot(freqs, cropped, linewidth=0.5, color="steelblue")
         axes[idx, 0].set_title(cls, fontsize=10)
@@ -602,21 +707,29 @@ def plot_fft_full_audio(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft
         axes[idx, 0].set_xlim(fft_crop_low, fft_crop_high)
         axes[idx, 0].set_ylim(bottom=0)
         axes[idx, 0].grid(True, alpha=0.3)
-    plt.suptitle(f"Full-Audio FFT ({fft_crop_low}–{fft_crop_high} Hz)", fontsize=13, y=1.01)
+    plt.suptitle(
+        f"Full-Audio FFT ({fft_crop_low}–{fft_crop_high} Hz)", fontsize=13, y=1.01
+    )
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
 def plot_word_vectors(
-    dataset_dir, output_path, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH, **proc_kwargs
+    dataset_dir,
+    output_path,
+    dwv_low=PAPER_DWV_LOW,
+    dwv_high=PAPER_DWV_HIGH,
+    **proc_kwargs,
 ):
     samples = _load_one_sample_per_class(dataset_dir)
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     axes_flat = axes.flatten()
     for idx, (cls, sig) in enumerate(samples.items()):
-        _, _, _, _, word_slice = _process_sample(sig, dwv_low=dwv_low, dwv_high=dwv_high, **proc_kwargs)
+        _, _, _, _, word_slice = _process_sample(
+            sig, dwv_low=dwv_low, dwv_high=dwv_high, **proc_kwargs
+        )
         freqs = np.linspace(dwv_low, dwv_high, len(word_slice))
         axes_flat[idx].bar(
             freqs, word_slice, width=(freqs[1] - freqs[0]) if len(freqs) > 1 else 1
@@ -632,8 +745,12 @@ def plot_word_vectors(
 
 
 def plot_acoustic_images(
-    dataset_dir, output_path, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH,
-    matrix_size=MATRIX_SIZE, **proc_kwargs
+    dataset_dir,
+    output_path,
+    dwv_low=PAPER_DWV_LOW,
+    dwv_high=PAPER_DWV_HIGH,
+    matrix_size=MATRIX_SIZE,
+    **proc_kwargs,
 ):
     samples = _load_one_sample_per_class(dataset_dir)
     n = len(samples)
@@ -641,7 +758,9 @@ def plot_acoustic_images(
     if n == 1:
         axes = [axes]
     for ax, (cls, sig) in zip(axes, samples.items()):
-        _, _, _, _, word_slice = _process_sample(sig, dwv_low=dwv_low, dwv_high=dwv_high, **proc_kwargs)
+        _, _, _, _, word_slice = _process_sample(
+            sig, dwv_low=dwv_low, dwv_high=dwv_high, **proc_kwargs
+        )
         expected = matrix_size * matrix_size
         if len(word_slice) < expected:
             padded = np.zeros(expected)
@@ -726,6 +845,11 @@ def main():
         help="Device: auto, cpu, cuda, mps",
     )
     parser.add_argument(
+        "--ram_cache",
+        action="store_true",
+        help="Pre-load all images into RAM to eliminate disk I/O during training",
+    )
+    parser.add_argument(
         "--filter_low",
         type=int,
         default=BANDPASS_LOW,
@@ -806,7 +930,7 @@ def main():
         "--no_resample",
         action="store_true",
         help="Do not resample audio; use native sample rate of each file. "
-             "Overrides --target_sr with the first file's native SR.",
+        "Overrides --target_sr with the first file's native SR.",
     )
     args = parser.parse_args()
 
@@ -817,7 +941,9 @@ def main():
             target_sr = detected_sr
             logger.info("--no_resample: using native sample rate %d Hz", target_sr)
         else:
-            logger.warning("--no_resample but no WAV files found; using --target_sr %d", target_sr)
+            logger.warning(
+                "--no_resample but no WAV files found; using --target_sr %d", target_sr
+            )
 
     segment_length = int(target_sr * args.segment_duration)
 
@@ -842,9 +968,7 @@ def main():
             args.dwv_range_low = auto_low
             args.dwv_range_high = auto_high
         else:
-            logger.warning(
-                "DWV analysis failed – falling back to --dwv_range_low/high"
-            )
+            logger.warning("DWV analysis failed – falling back to --dwv_range_low/high")
 
     dwv_low = args.dwv_range_low
     dwv_high = args.dwv_range_high
@@ -853,7 +977,10 @@ def main():
         logger.warning(
             "DWV range [%d-%d Hz] is OUTSIDE FFT crop [%d-%d Hz]. "
             "Clamping to crop bounds. Set --dwv_range_low/high within the crop range.",
-            dwv_low, dwv_high, args.fft_crop_low, args.fft_crop_high,
+            dwv_low,
+            dwv_high,
+            args.fft_crop_low,
+            args.fft_crop_high,
         )
         dwv_low = max(dwv_low, args.fft_crop_low)
         dwv_high = min(dwv_high, args.fft_crop_high)
@@ -861,10 +988,17 @@ def main():
     logger.info("Using DWV range: %d–%d Hz", dwv_low, dwv_high)
     logger.info(
         "Parameters: target_sr=%d Hz, resample=%s, filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
-        target_sr, not args.no_resample,
-        args.filter_low, args.filter_high, args.filter_order,
-        args.fft_crop_low, args.fft_crop_high, args.word_k,
-        args.matrix_size, args.matrix_size, args.segment_duration,
+        target_sr,
+        not args.no_resample,
+        args.filter_low,
+        args.filter_high,
+        args.filter_order,
+        args.fft_crop_low,
+        args.fft_crop_high,
+        args.word_k,
+        args.matrix_size,
+        args.matrix_size,
+        args.segment_duration,
     )
 
     torch.manual_seed(args.seed)
@@ -886,27 +1020,40 @@ def main():
         dataset_dir = Path(args.dataset_dir)
 
         logger.info("Generating paper figures...")
-        plot_time_domain(dataset_dir, plots_dir / "01_time_domain_signals.png",
-                         target_sr=target_sr, no_resample=args.no_resample)
+        plot_time_domain(
+            dataset_dir,
+            plots_dir / "01_time_domain_signals.png",
+            target_sr=target_sr,
+            no_resample=args.no_resample,
+        )
         logger.info("  Saved time-domain signals")
         plot_fft_spectra(
-            dataset_dir, plots_dir / "02_fft_spectra.png",
+            dataset_dir,
+            plots_dir / "02_fft_spectra.png",
             **proc_kwargs,
         )
         logger.info("  Saved FFT spectra")
         plot_fft_full_audio(
-            dataset_dir, plots_dir / "02b_fft_full_audio.png",
+            dataset_dir,
+            plots_dir / "02b_fft_full_audio.png",
             **proc_kwargs,
         )
         logger.info("  Saved full-audio FFT spectra")
         plot_word_vectors(
-            dataset_dir, plots_dir / "03_word_vector_maps.png", dwv_low, dwv_high,
+            dataset_dir,
+            plots_dir / "03_word_vector_maps.png",
+            dwv_low,
+            dwv_high,
             **proc_kwargs,
         )
         logger.info("  Saved word vector maps")
         plot_acoustic_images(
-            dataset_dir, plots_dir / "04_acoustic_images.png", dwv_low, dwv_high,
-            matrix_size=args.matrix_size, **proc_kwargs,
+            dataset_dir,
+            plots_dir / "04_acoustic_images.png",
+            dwv_low,
+            dwv_high,
+            matrix_size=args.matrix_size,
+            **proc_kwargs,
         )
         logger.info("  Saved acoustic images")
 
@@ -927,19 +1074,32 @@ def main():
         )
         image_dir.mkdir(parents=True, exist_ok=True)
         ok = _run_pipeline(
-            image_dir, args.dataset_dir, dwv_low, dwv_high,
-            args.matrix_size, args.output_size,
+            image_dir,
+            args.dataset_dir,
+            dwv_low,
+            dwv_high,
+            args.matrix_size,
+            args.output_size,
             **proc_kwargs,
         )
         if not ok:
             logger.error("Auto-generation failed")
             sys.exit(1)
 
-    eval_ds = datasets.ImageFolder(str(image_dir), transform=get_transforms(False))
-    train_ds = datasets.ImageFolder(str(image_dir), transform=get_transforms(True))
-    class_names = eval_ds.classes
+    if args.ram_cache:
+        logger.info("RAM cache enabled – pre-loading images into memory")
+        raw_ds = datasets.ImageFolder(str(image_dir))
+        eval_ds = InMemoryImageDataset(raw_ds, transform=get_transforms(False))
+        train_ds = InMemoryImageDataset(raw_ds, transform=get_transforms(True))
+        class_names = raw_ds.classes
+        targets = np.array(raw_ds.targets)
+    else:
+        eval_ds = datasets.ImageFolder(str(image_dir), transform=get_transforms(False))
+        train_ds = datasets.ImageFolder(str(image_dir), transform=get_transforms(True))
+        class_names = eval_ds.classes
+        targets = np.array(eval_ds.targets)
+
     num_classes = len(class_names)
-    targets = np.array(eval_ds.targets)
 
     logger.info(
         "Dataset: %d images, %d classes: %s",
@@ -953,7 +1113,9 @@ def main():
     )
     logger.info(
         "Split: %d train, %d val, %d test (%.0f%%/%.0f%%/%.0f%%)",
-        len(train_idx), len(val_idx), len(test_idx),
+        len(train_idx),
+        len(val_idx),
+        len(test_idx),
         100 * len(train_idx) / len(targets),
         100 * len(val_idx) / len(targets),
         100 * len(test_idx) / len(targets),
@@ -963,19 +1125,25 @@ def main():
         Subset(train_ds, train_idx),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=16,
+        pin_memory=True,
+        prefetch_factor=2,
     )
     val_loader = DataLoader(
         Subset(eval_ds, val_idx),
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=16,
+        pin_memory=True,
+        prefetch_factor=2,
     )
     test_loader = DataLoader(
         Subset(eval_ds, test_idx),
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=16,
+        pin_memory=True,
+        prefetch_factor=2,
     )
 
     models_dir = output_dir / "models"
@@ -1013,9 +1181,14 @@ def main():
 
         criterion = nn.CrossEntropyLoss()
         _, val_er, val_mer, _ = evaluate_model(model, val_loader, criterion, device)
-        _, test_er, test_mer, test_cm = evaluate_model(model, test_loader, criterion, device)
+        _, test_er, test_mer, test_cm = evaluate_model(
+            model, test_loader, criterion, device
+        )
         plot_confusion_matrix(
-            test_cm, class_names, model_name, results_dir / f"{model_name}_confusion.png"
+            test_cm,
+            class_names,
+            model_name,
+            results_dir / f"{model_name}_confusion.png",
         )
 
         all_results[model_name] = {
@@ -1029,7 +1202,11 @@ def main():
 
         logger.info(
             "[%s] Final — Val ER: %.1f%%  Val MER: %.1f%%  |  Test ER: %.1f%%  Test MER: %.1f%%",
-            model_name, val_er, val_mer, test_er, test_mer,
+            model_name,
+            val_er,
+            val_mer,
+            test_er,
+            test_mer,
         )
 
     # ------------------------------------------------------------------
@@ -1065,16 +1242,20 @@ def main():
             val_ers = [f["val_er"] for f in folds]
             val_mers = [f["val_mer"] for f in folds]
             kfold_results[model_name] = {
-                "test_ers": test_ers, "test_mers": test_mers,
-                "val_ers": val_ers, "val_mers": val_mers,
+                "test_ers": test_ers,
+                "test_mers": test_mers,
+                "val_ers": val_ers,
+                "val_mers": val_mers,
                 "folds": folds,
             }
 
             logger.info(
                 "[%s] K-fold  Val ER: %.1f ± %.1f%%  |  Test ER: %.1f ± %.1f%%",
                 model_name,
-                np.mean(val_ers), np.std(val_ers),
-                np.mean(test_ers), np.std(test_ers),
+                np.mean(val_ers),
+                np.std(val_ers),
+                np.mean(test_ers),
+                np.std(test_ers),
             )
 
             np.savez(
@@ -1096,9 +1277,9 @@ def main():
         fh.write(f"Total images: {len(eval_ds)}\n")
         fh.write(
             f"Train/Val/Test split: {len(train_idx)}/{len(val_idx)}/{len(test_idx)} "
-            f"({100*len(train_idx)/len(targets):.0f}%/"
-            f"{100*len(val_idx)/len(targets):.0f}%/"
-            f"{100*len(test_idx)/len(targets):.0f}%)\n"
+            f"({100 * len(train_idx) / len(targets):.0f}%/"
+            f"{100 * len(val_idx) / len(targets):.0f}%/"
+            f"{100 * len(test_idx) / len(targets):.0f}%)\n"
         )
         fh.write(
             f"Epochs: {args.epochs}   LR: {args.lr}   Batch: {args.batch_size}\n\n"
@@ -1140,10 +1321,10 @@ def main():
         num_params = sum(p.numel() for p in model.parameters()) / 1e6
 
         print("\n---")
-        print(f"val_acc:          {res['val_er']/100.0:.4f}  (Val ER)")
-        print(f"val_mer:          {res['val_mer']/100.0:.4f}  (Val MER)")
-        print(f"test_acc:         {res['test_er']/100.0:.4f}  (Test ER)")
-        print(f"test_mer:         {res['test_mer']/100.0:.4f}  (Test MER)")
+        print(f"val_acc:          {res['val_er'] / 100.0:.4f}  (Val ER)")
+        print(f"val_mer:          {res['val_mer'] / 100.0:.4f}  (Val MER)")
+        print(f"test_acc:         {res['test_er'] / 100.0:.4f}  (Test ER)")
+        print(f"test_mer:         {res['test_mer'] / 100.0:.4f}  (Test MER)")
         print(f"num_params_M:     {num_params:.1f}")
         print(f"best_model:       {best_model_name}")
         print("---")
