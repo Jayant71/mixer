@@ -204,18 +204,27 @@ def create_acoustic_image(
     return matrix_w
 
 
-def process_segment(segment, fs):
+def process_segment(
+    segment,
+    fs,
+    filter_low=BANDPASS_LOW,
+    filter_high=BANDPASS_HIGH,
+    filter_order=FILTER_ORDER,
+    fft_crop_low=FFT_CROP_LOW,
+    fft_crop_high=FFT_CROP_HIGH,
+    word_k=WORD_CODING_K,
+):
     """Run steps 2-4 on a single 1-second segment; return word vector + freq info."""
-    filtered = pre_filter(segment, BANDPASS_LOW, BANDPASS_HIGH, fs)
+    filtered = pre_filter(segment, filter_low, filter_high, fs, order=filter_order)
     normalized = normalize_amplitude(filtered)
     spectrum = compute_fft_magnitude(normalized)
     cropped, base_freq, freq_res = crop_spectrum(
-        spectrum, FFT_CROP_LOW, FFT_CROP_HIGH, fs
+        spectrum, fft_crop_low, fft_crop_high, fs
     )
     max_mag = np.max(cropped)
     if max_mag > 0:
         cropped = cropped / max_mag
-    wv = word_coding(cropped, WORD_CODING_K)
+    wv = word_coding(cropped, word_k)
     return wv, base_freq, freq_res
 
 
@@ -240,6 +249,60 @@ def main():
         type=str,
         default="output_paper1",
         help="Path to output directory",
+    )
+    parser.add_argument(
+        "--segment_duration",
+        type=float,
+        default=1.0,
+        help="Segment length in seconds (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--filter_low",
+        type=int,
+        default=BANDPASS_LOW,
+        help="Low-pass/bandpass lower cutoff frequency in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--filter_high",
+        type=int,
+        default=BANDPASS_HIGH,
+        help="Low-pass upper cutoff frequency in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--filter_order",
+        type=int,
+        default=FILTER_ORDER,
+        help="Butterworth filter order (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--fft_crop_low",
+        type=int,
+        default=FFT_CROP_LOW,
+        help="FFT crop lower bound in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--fft_crop_high",
+        type=int,
+        default=FFT_CROP_HIGH,
+        help="FFT crop upper bound in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--word_k",
+        type=float,
+        default=WORD_CODING_K,
+        help="Word coding discretization step k (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--matrix_size",
+        type=int,
+        default=MATRIX_SIZE,
+        help="Square matrix side length; bins = matrix_size^2 (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output_size",
+        type=int,
+        default=OUTPUT_SIZE,
+        help="Resized output image dimension in px (default: %(default)s)",
     )
     parser.add_argument(
         "--dwv_range_low",
@@ -281,6 +344,11 @@ def main():
         sys.exit(1)
 
     logger.info("Found %d classes: %s", len(class_dirs), [d.name for d in class_dirs])
+    segment_length = int(TARGET_SR * args.segment_duration)
+    logger.info("Parameters: filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
+                args.filter_low, args.filter_high, args.filter_order,
+                args.fft_crop_low, args.fft_crop_high, args.word_k,
+                args.matrix_size, args.matrix_size, args.segment_duration)
 
     # ------------------------------------------------------------------
     # Phase 1 – Load audio, segment, compute word vectors per segment
@@ -311,11 +379,20 @@ def main():
                 continue
 
             signal = resample_signal(signal, sr, TARGET_SR)
-            segments = segment_signal(signal, SEGMENT_LENGTH)
+            segments = segment_signal(signal, segment_length)
 
             for seg_idx, segment in enumerate(segments):
                 try:
-                    wv, base_freq, freq_res = process_segment(segment, TARGET_SR)
+                    wv, base_freq, freq_res = process_segment(
+                        segment,
+                        TARGET_SR,
+                        filter_low=args.filter_low,
+                        filter_high=args.filter_high,
+                        filter_order=args.filter_order,
+                        fft_crop_low=args.fft_crop_low,
+                        fft_crop_high=args.fft_crop_high,
+                        word_k=args.word_k,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Failed on segment %d of %s: %s", seg_idx, wav_file.name, exc
@@ -352,11 +429,11 @@ def main():
         np.save(dwv_output_dir / "dwv_values.npy", dwv)
         logger.info("DWV max difference: %.4f", np.max(dwv))
 
-        expected_components = MATRIX_SIZE * MATRIX_SIZE
+        expected_components = args.matrix_size * args.matrix_size
         best_start, best_end, best_sum = find_optimal_range(dwv, expected_components)
-        freq_resolution = TARGET_SR / SEGMENT_LENGTH
-        auto_low = int(FFT_CROP_LOW + best_start * freq_resolution)
-        auto_high = int(FFT_CROP_LOW + best_end * freq_resolution)
+        freq_resolution = TARGET_SR / segment_length
+        auto_low = int(args.fft_crop_low + best_start * freq_resolution)
+        auto_high = int(args.fft_crop_low + best_end * freq_resolution)
         logger.info(
             "Auto-detected optimal range: %d-%d Hz  (sum=%.4f)",
             auto_low,
@@ -394,6 +471,15 @@ def main():
         range_high = args.dwv_range_high
         logger.info("Using PAPER range: %d-%d Hz", range_low, range_high)
 
+    if range_low < args.fft_crop_low or range_high > args.fft_crop_high:
+        logger.warning(
+            "DWV range [%d-%d Hz] is OUTSIDE FFT crop [%d-%d Hz]. "
+            "Clamping to crop bounds. Set --dwv_range_low/high within the crop range.",
+            range_low, range_high, args.fft_crop_low, args.fft_crop_high,
+        )
+        range_low = max(range_low, args.fft_crop_low)
+        range_high = min(range_high, args.fft_crop_high)
+
     # ------------------------------------------------------------------
     # Phase 3 – Generate acoustic images
     # ------------------------------------------------------------------
@@ -415,7 +501,11 @@ def main():
         class_name, source_file, seg_idx, wv, base_freq, freq_res = entry
 
         word_slice = extract_dwv_range(wv, base_freq, freq_res, range_low, range_high)
-        acoustic_img = create_acoustic_image(word_slice)
+        acoustic_img = create_acoustic_image(
+            word_slice,
+            matrix_size=args.matrix_size,
+            output_size=args.output_size,
+        )
 
         class_img_dir = images_dir / class_name
         class_img_dir.mkdir(parents=True, exist_ok=True)

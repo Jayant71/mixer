@@ -53,13 +53,18 @@ from paper1_pipeline import (
     SEGMENT_LENGTH,
     TARGET_SR,
     WORD_CODING_K,
+    compute_dwv_analysis,
     compute_fft_magnitude,
+    create_acoustic_image,
     crop_spectrum,
     extract_dwv_range,
+    find_optimal_range,
     load_audio,
     normalize_amplitude,
     pre_filter,
+    process_segment,
     resample_signal,
+    save_image,
     segment_signal,
     word_coding,
 )
@@ -121,12 +126,17 @@ def get_transforms(augment=False):
     )
 
 
-def split_dataset(targets, test_size=0.2, seed=42):
+def split_dataset(targets, test_size=0.15, val_size=0.15, seed=42):
     indices = np.arange(len(targets))
-    train_idx, test_idx = train_test_split(
+    train_val_idx, test_idx = train_test_split(
         indices, test_size=test_size, stratify=targets, random_state=seed
     )
-    return train_idx, test_idx
+    train_val_targets = targets[train_val_idx]
+    val_fraction = val_size / (1.0 - test_size)
+    train_idx, val_idx = train_test_split(
+        train_val_idx, test_size=val_fraction, stratify=train_val_targets, random_state=seed
+    )
+    return train_idx, val_idx, test_idx
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -178,7 +188,7 @@ def evaluate_model(model, loader, criterion, device):
 
 
 def train_and_evaluate(
-    model_name, train_loader, test_loader, num_classes, epochs, lr, device
+    model_name, train_loader, val_loader, num_classes, epochs, lr, device
 ):
     model = create_model(model_name, num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
@@ -189,9 +199,9 @@ def train_and_evaluate(
     history = {
         "train_loss": [],
         "train_acc": [],
-        "test_loss": [],
-        "test_er": [],
-        "test_mer": [],
+        "val_loss": [],
+        "val_er": [],
+        "val_mer": [],
     }
 
     for epoch in range(epochs):
@@ -199,23 +209,23 @@ def train_and_evaluate(
         t_loss, t_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
-        v_loss, er, mer, _ = evaluate_model(model, test_loader, criterion, device)
+        v_loss, er, mer, _ = evaluate_model(model, val_loader, criterion, device)
         scheduler.step()
         epoch_time = time.time() - start_time
         curr_lr = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(t_loss)
         history["train_acc"].append(t_acc)
-        history["test_loss"].append(v_loss)
-        history["test_er"].append(er)
-        history["test_mer"].append(mer)
+        history["val_loss"].append(v_loss)
+        history["val_er"].append(er)
+        history["val_mer"].append(mer)
 
         if er > best_er:
             best_er = er
             best_state = copy.deepcopy(model.state_dict())
 
         logger.info(
-            "[%s] Epoch %3d/%d | Time: %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | ER: %.1f%% | MER: %.1f%%",
+            "[%s] Epoch %3d/%d | Time: %.1fs | LR: %.6f | Loss: %.4f | Acc: %.1f%% | Val Loss: %.4f | Val ER: %.1f%% | Val MER: %.1f%%",
             model_name,
             epoch + 1,
             epochs,
@@ -245,16 +255,28 @@ def run_kfold(
     batch_size,
     device,
     seed,
+    val_fraction=0.15,
 ):
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     fold_results = []
 
-    for fold, (tr_idx, te_idx) in enumerate(skf.split(np.zeros(len(targets)), targets)):
+    for fold, (train_val_idx, te_idx) in enumerate(skf.split(np.zeros(len(targets)), targets)):
         logger.info("  [%s] Fold %d/%d", model_name, fold + 1, k)
+        train_val_targets = targets[train_val_idx]
+        tr_idx, va_idx = train_test_split(
+            train_val_idx, test_size=val_fraction,
+            stratify=train_val_targets, random_state=seed,
+        )
         tr_loader = DataLoader(
             Subset(train_ds, tr_idx.tolist()),
             batch_size=batch_size,
             shuffle=True,
+            num_workers=0,
+        )
+        va_loader = DataLoader(
+            Subset(eval_ds, va_idx.tolist()),
+            batch_size=batch_size,
+            shuffle=False,
             num_workers=0,
         )
         te_loader = DataLoader(
@@ -263,14 +285,20 @@ def run_kfold(
             shuffle=False,
             num_workers=0,
         )
-        _, _, er, mer, cm = None, None, 0.0, 0.0, None
         model, hist = train_and_evaluate(
-            model_name, tr_loader, te_loader, num_classes, epochs, lr, device
+            model_name, tr_loader, va_loader, num_classes, epochs, lr, device
         )
         criterion = nn.CrossEntropyLoss()
-        _, er, mer, cm = evaluate_model(model, te_loader, criterion, device)
-        fold_results.append({"er": er, "mer": mer, "cm": cm, "history": hist})
-        logger.info("    Fold %d: ER=%.1f%%  MER=%.1f%%", fold + 1, er, mer)
+        _, val_er, val_mer, _ = evaluate_model(model, va_loader, criterion, device)
+        _, test_er, test_mer, cm = evaluate_model(model, te_loader, criterion, device)
+        fold_results.append({
+            "val_er": val_er, "val_mer": val_mer,
+            "test_er": test_er, "test_mer": test_mer,
+            "cm": cm, "history": hist,
+        })
+        logger.info(
+            "    Fold %d: Val ER=%.1f%%  Test ER=%.1f%%", fold + 1, val_er, test_er,
+        )
 
     return fold_results
 
@@ -278,20 +306,20 @@ def run_kfold(
 def plot_training_curves(history, model_name, output_path):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     axes[0].plot(history["train_loss"], label="Train Loss")
-    if "test_loss" in history:
-        axes[0].plot(history["test_loss"], label="Test Loss")
+    if "val_loss" in history:
+        axes[0].plot(history["val_loss"], label="Val Loss")
     axes[0].set_title("Loss (Error)")
     axes[0].set_xlabel("Epoch")
     axes[0].legend()
 
     axes[1].plot(history["train_acc"], label="Train Acc")
-    axes[1].plot(history["test_er"], label="Test ER")
-    axes[1].set_title("Accuracy / ER (%)")
+    axes[1].plot(history["val_er"], label="Val ER")
+    axes[1].set_title("Accuracy / Val ER (%)")
     axes[1].set_xlabel("Epoch")
     axes[1].legend()
 
-    axes[2].plot(history["test_mer"])
-    axes[2].set_title("Test MER (%)")
+    axes[2].plot(history["val_mer"])
+    axes[2].set_title("Val MER (%)")
     axes[2].set_xlabel("Epoch")
 
     fig.suptitle(model_name)
@@ -350,21 +378,137 @@ def _load_one_sample_per_class(dataset_dir):
     return samples
 
 
-def _process_sample(signal, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH):
-    segments = segment_signal(signal, SEGMENT_LENGTH)
+def _process_sample(
+    signal,
+    dwv_low=PAPER_DWV_LOW,
+    dwv_high=PAPER_DWV_HIGH,
+    filter_low=BANDPASS_LOW,
+    filter_high=BANDPASS_HIGH,
+    filter_order=5,
+    fft_crop_low=FFT_CROP_LOW,
+    fft_crop_high=FFT_CROP_HIGH,
+    word_k=WORD_CODING_K,
+    segment_length=SEGMENT_LENGTH,
+):
+    segments = segment_signal(signal, segment_length)
     seg = segments[0] if segments else np.zeros(SEGMENT_LENGTH)
-    filtered = pre_filter(seg, BANDPASS_LOW, BANDPASS_HIGH, TARGET_SR)
+    filtered = pre_filter(seg, filter_low, filter_high, TARGET_SR, order=filter_order)
     normalized = normalize_amplitude(filtered)
     spectrum = compute_fft_magnitude(normalized)
     cropped, base_freq, freq_res = crop_spectrum(
-        spectrum, FFT_CROP_LOW, FFT_CROP_HIGH, TARGET_SR
+        spectrum, fft_crop_low, fft_crop_high, TARGET_SR
     )
     max_mag = np.max(cropped)
     if max_mag > 0:
         cropped = cropped / max_mag
-    wv = word_coding(cropped, WORD_CODING_K)
+    wv = word_coding(cropped, word_k)
     word_slice = extract_dwv_range(wv, base_freq, freq_res, dwv_low, dwv_high)
     return seg, cropped, base_freq, freq_res, word_slice
+
+
+def _compute_auto_dwv_range(dataset_dir, matrix_size, segment_length=SEGMENT_LENGTH, **proc_kwargs):
+    from collections import defaultdict
+
+    dataset_path = Path(dataset_dir)
+    class_dirs = sorted(
+        [d for d in dataset_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    )
+
+    all_word_vectors = defaultdict(list)
+    for class_dir in class_dirs:
+        wav_files = sorted(
+            [f for f in class_dir.iterdir() if f.suffix.lower() == ".wav" and not f.name.startswith(".")]
+        )
+        for wav_file in wav_files:
+            try:
+                signal, sr = load_audio(str(wav_file))
+            except Exception:
+                continue
+            signal = resample_signal(signal, sr, TARGET_SR)
+            segments = segment_signal(signal, segment_length)
+            for segment in segments:
+                try:
+                    wv, _, _ = process_segment(segment, TARGET_SR, **proc_kwargs)
+                except Exception:
+                    continue
+                all_word_vectors[class_dir.name].append(wv)
+
+    if not all_word_vectors:
+        return None, None
+
+    dwv = compute_dwv_analysis(dict(all_word_vectors))
+    if len(dwv) == 0:
+        return None, None
+
+    expected = matrix_size * matrix_size
+    best_start, best_end, best_sum = find_optimal_range(dwv, expected)
+    freq_resolution = TARGET_SR / segment_length
+    fft_crop_low = proc_kwargs.get("fft_crop_low", FFT_CROP_LOW)
+    auto_low = int(fft_crop_low + best_start * freq_resolution)
+    auto_high = int(fft_crop_low + best_end * freq_resolution)
+
+    logger.info(
+        "Auto-detected DWV range from dataset: %d-%d Hz (sum=%.4f)",
+        auto_low, auto_high, best_sum,
+    )
+    return auto_low, auto_high
+
+
+def _run_pipeline(image_dir, dataset_dir, dwv_low, dwv_high, matrix_size, output_size, segment_length=SEGMENT_LENGTH, **proc_kwargs):
+    from collections import defaultdict
+
+    dataset_path = Path(dataset_dir)
+    class_dirs = sorted(
+        [d for d in dataset_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    )
+    if not class_dirs:
+        logger.error("No class directories found in %s", dataset_path)
+        return False
+
+    all_word_vectors = defaultdict(list)
+    segment_registry = []
+
+    for class_dir in class_dirs:
+        class_name = class_dir.name
+        wav_files = sorted(
+            [f for f in class_dir.iterdir() if f.suffix.lower() == ".wav" and not f.name.startswith(".")]
+        )
+        logger.info("  Processing class '%s': %d WAV files", class_name, len(wav_files))
+        for wav_file in wav_files:
+            try:
+                signal, sr = load_audio(str(wav_file))
+            except Exception as exc:
+                logger.warning("Failed to load %s: %s", wav_file, exc)
+                continue
+            signal = resample_signal(signal, sr, TARGET_SR)
+            segments = segment_signal(signal, segment_length)
+            for seg_idx, segment in enumerate(segments):
+                try:
+                    wv, base_freq, freq_res = process_segment(segment, TARGET_SR, **proc_kwargs)
+                except Exception as exc:
+                    logger.warning("Failed on segment %d of %s: %s", seg_idx, wav_file.name, exc)
+                    continue
+                all_word_vectors[class_name].append(wv)
+                segment_registry.append((class_name, wav_file, seg_idx, wv, base_freq, freq_res))
+
+    if not segment_registry:
+        logger.error("No segments generated from dataset")
+        return False
+
+    images_path = Path(image_dir)
+    total = 0
+    for entry in segment_registry:
+        class_name, source_file, seg_idx, wv, base_freq, freq_res = entry
+        word_slice = extract_dwv_range(wv, base_freq, freq_res, dwv_low, dwv_high)
+        acoustic_img = create_acoustic_image(word_slice, matrix_size=matrix_size, output_size=output_size)
+        class_img_dir = images_path / class_name
+        class_img_dir.mkdir(parents=True, exist_ok=True)
+        img_filename = f"{source_file.stem}_seg{seg_idx:03d}.png"
+        save_image(acoustic_img, class_img_dir / img_filename)
+        total += 1
+
+    logger.info("Generated %d acoustic images in %s", total, images_path)
+    return True
 
 
 def plot_time_domain(dataset_dir, output_path):
@@ -386,35 +530,60 @@ def plot_time_domain(dataset_dir, output_path):
     plt.close()
 
 
-def plot_fft_spectra(dataset_dir, output_path):
+def plot_fft_spectra(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_crop_high=FFT_CROP_HIGH, **proc_kwargs):
     samples = _load_one_sample_per_class(dataset_dir)
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     for idx, (cls, sig) in enumerate(samples.items()):
-        _, cropped, base_freq, freq_res, _ = _process_sample(sig)
+        _, cropped, base_freq, freq_res, _ = _process_sample(sig, fft_crop_low=fft_crop_low, fft_crop_high=fft_crop_high, **proc_kwargs)
         freqs = np.arange(len(cropped)) * freq_res + base_freq
         axes[idx, 0].bar(freqs, cropped, width=freq_res, align="center")
         axes[idx, 0].set_title(cls, fontsize=10)
         axes[idx, 0].set_xlabel("Frequency (Hz)")
         axes[idx, 0].set_ylabel("Normalized Amplitude")
-        axes[idx, 0].set_xlim(FFT_CROP_LOW, FFT_CROP_HIGH)
+        axes[idx, 0].set_xlim(fft_crop_low, fft_crop_high)
         axes[idx, 0].set_ylim(bottom=0)
         axes[idx, 0].grid(True, alpha=0.3)
-    plt.suptitle("FFT Spectra (1–1000 Hz)", fontsize=13, y=1.01)
+    plt.suptitle(f"FFT Spectra ({fft_crop_low}–{fft_crop_high} Hz)", fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_fft_full_audio(dataset_dir, output_path, fft_crop_low=FFT_CROP_LOW, fft_crop_high=FFT_CROP_HIGH, **proc_kwargs):
+    samples = _load_one_sample_per_class(dataset_dir)
+    n = len(samples)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
+    for idx, (cls, sig) in enumerate(samples.items()):
+        filter_high = proc_kwargs.get("filter_high", BANDPASS_HIGH)
+        filter_order = proc_kwargs.get("filter_order", 5)
+        filtered = pre_filter(sig, proc_kwargs.get("filter_low", BANDPASS_LOW), filter_high, TARGET_SR, order=filter_order)
+        normalized = normalize_amplitude(filtered)
+        spectrum = compute_fft_magnitude(normalized)
+        cropped, base_freq, freq_res = crop_spectrum(spectrum, fft_crop_low, fft_crop_high, TARGET_SR)
+        freqs = np.arange(len(cropped)) * freq_res + base_freq
+        axes[idx, 0].plot(freqs, cropped, linewidth=0.5, color="steelblue")
+        axes[idx, 0].set_title(cls, fontsize=10)
+        axes[idx, 0].set_xlabel("Frequency (Hz)")
+        axes[idx, 0].set_ylabel("Normalized Amplitude")
+        axes[idx, 0].set_xlim(fft_crop_low, fft_crop_high)
+        axes[idx, 0].set_ylim(bottom=0)
+        axes[idx, 0].grid(True, alpha=0.3)
+    plt.suptitle(f"Full-Audio FFT ({fft_crop_low}–{fft_crop_high} Hz)", fontsize=13, y=1.01)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
 def plot_word_vectors(
-    dataset_dir, output_path, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH
+    dataset_dir, output_path, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH, **proc_kwargs
 ):
     samples = _load_one_sample_per_class(dataset_dir)
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(14, 2.5 * n), squeeze=False)
     axes_flat = axes.flatten()
     for idx, (cls, sig) in enumerate(samples.items()):
-        _, _, _, _, word_slice = _process_sample(sig, dwv_low, dwv_high)
+        _, _, _, _, word_slice = _process_sample(sig, dwv_low=dwv_low, dwv_high=dwv_high, **proc_kwargs)
         freqs = np.linspace(dwv_low, dwv_high, len(word_slice))
         axes_flat[idx].bar(
             freqs, word_slice, width=(freqs[1] - freqs[0]) if len(freqs) > 1 else 1
@@ -430,7 +599,8 @@ def plot_word_vectors(
 
 
 def plot_acoustic_images(
-    dataset_dir, output_path, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH
+    dataset_dir, output_path, dwv_low=PAPER_DWV_LOW, dwv_high=PAPER_DWV_HIGH,
+    matrix_size=MATRIX_SIZE, **proc_kwargs
 ):
     samples = _load_one_sample_per_class(dataset_dir)
     n = len(samples)
@@ -438,19 +608,19 @@ def plot_acoustic_images(
     if n == 1:
         axes = [axes]
     for ax, (cls, sig) in zip(axes, samples.items()):
-        _, _, _, _, word_slice = _process_sample(sig, dwv_low, dwv_high)
-        expected = MATRIX_SIZE * MATRIX_SIZE
+        _, _, _, _, word_slice = _process_sample(sig, dwv_low=dwv_low, dwv_high=dwv_high, **proc_kwargs)
+        expected = matrix_size * matrix_size
         if len(word_slice) < expected:
             padded = np.zeros(expected)
             padded[: len(word_slice)] = word_slice
             word_slice = padded
         else:
             word_slice = word_slice[:expected]
-        matrix_a = word_slice.reshape(MATRIX_SIZE, MATRIX_SIZE)
+        matrix_a = word_slice.reshape(matrix_size, matrix_size)
         ax.imshow(matrix_a, cmap="gray", aspect="equal", interpolation="nearest")
         ax.set_title(cls, fontsize=9)
         ax.axis("off")
-    plt.suptitle("Acoustic Images (17×17)", fontsize=13)
+    plt.suptitle(f"Acoustic Images ({matrix_size}×{matrix_size})", fontsize=13)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -481,8 +651,14 @@ def main():
     parser.add_argument(
         "--test_size",
         type=float,
-        default=0.2,
-        help="Test set size (0.0 to 1.0, default: 0.2 for 80/20 split)",
+        default=0.15,
+        help="Test set fraction (default: 0.15)",
+    )
+    parser.add_argument(
+        "--val_size",
+        type=float,
+        default=0.15,
+        help="Validation set fraction (default: 0.15)",
     )
     parser.add_argument(
         "--epochs", type=int, default=50, help="Training epochs (default: 50)"
@@ -517,9 +693,63 @@ def main():
         help="Device: auto, cpu, cuda, mps",
     )
     parser.add_argument(
+        "--filter_low",
+        type=int,
+        default=BANDPASS_LOW,
+        help="Low-pass/bandpass lower cutoff frequency in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--filter_high",
+        type=int,
+        default=BANDPASS_HIGH,
+        help="Low-pass upper cutoff frequency in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--filter_order",
+        type=int,
+        default=5,
+        help="Butterworth filter order (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--fft_crop_low",
+        type=int,
+        default=FFT_CROP_LOW,
+        help="FFT crop lower bound in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--fft_crop_high",
+        type=int,
+        default=FFT_CROP_HIGH,
+        help="FFT crop upper bound in Hz (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--word_k",
+        type=float,
+        default=WORD_CODING_K,
+        help="Word coding discretization step k (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--matrix_size",
+        type=int,
+        default=MATRIX_SIZE,
+        help="Square matrix side length; bins = matrix_size^2 (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output_size",
+        type=int,
+        default=224,
+        help="Resized output image dimension in px (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--segment_duration",
+        type=float,
+        default=1.0,
+        help="Segment length in seconds (default: %(default)s)",
+    )
+    parser.add_argument(
         "--auto_range",
         action="store_true",
-        help="Read auto-detected DWV range from output_paper1/dwv_analysis/dwv_report.txt",
+        help="Auto-detect DWV range from dataset using current parameters",
     )
     parser.add_argument(
         "--dwv_range_low",
@@ -535,32 +765,50 @@ def main():
     )
     args = parser.parse_args()
 
+    segment_length = int(TARGET_SR * args.segment_duration)
+
+    proc_kwargs = dict(
+        filter_low=args.filter_low,
+        filter_high=args.filter_high,
+        filter_order=args.filter_order,
+        fft_crop_low=args.fft_crop_low,
+        fft_crop_high=args.fft_crop_high,
+        word_k=args.word_k,
+        segment_length=segment_length,
+    )
+
     if args.auto_range:
-        report_path = Path("output_paper1") / "dwv_analysis" / "dwv_report.txt"
-        if report_path.exists():
-            with open(report_path) as fh:
-                for line in fh:
-                    if line.startswith("Auto-detected optimal range:"):
-                        parts = line.split(":")[1].strip()
-                        range_part = parts.split()[0]
-                        low_s, high_s = range_part.split("-")
-                        args.dwv_range_low = int(low_s)
-                        args.dwv_range_high = int(high_s)
-                        break
-            logger.info(
-                "Auto-detected DWV range: %d–%d Hz",
-                args.dwv_range_low,
-                args.dwv_range_high,
-            )
+        logger.info("Running DWV analysis on dataset with current parameters...")
+        auto_low, auto_high = _compute_auto_dwv_range(
+            args.dataset_dir, args.matrix_size, **proc_kwargs
+        )
+        if auto_low is not None and auto_high is not None:
+            args.dwv_range_low = auto_low
+            args.dwv_range_high = auto_high
         else:
             logger.warning(
-                "DWV report not found at %s – falling back to --dwv_range_low/high",
-                report_path,
+                "DWV analysis failed – falling back to --dwv_range_low/high"
             )
 
     dwv_low = args.dwv_range_low
     dwv_high = args.dwv_range_high
+
+    if dwv_low < args.fft_crop_low or dwv_high > args.fft_crop_high:
+        logger.warning(
+            "DWV range [%d-%d Hz] is OUTSIDE FFT crop [%d-%d Hz]. "
+            "Clamping to crop bounds. Set --dwv_range_low/high within the crop range.",
+            dwv_low, dwv_high, args.fft_crop_low, args.fft_crop_high,
+        )
+        dwv_low = max(dwv_low, args.fft_crop_low)
+        dwv_high = min(dwv_high, args.fft_crop_high)
+
     logger.info("Using DWV range: %d–%d Hz", dwv_low, dwv_high)
+    logger.info(
+        "Parameters: filter=%d-%d Hz (order %d), fft_crop=%d-%d Hz, k=%.4f, matrix=%dx%d, segment=%.1fs",
+        args.filter_low, args.filter_high, args.filter_order,
+        args.fft_crop_low, args.fft_crop_high, args.word_k,
+        args.matrix_size, args.matrix_size, args.segment_duration,
+    )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -583,14 +831,24 @@ def main():
         logger.info("Generating paper figures...")
         plot_time_domain(dataset_dir, plots_dir / "01_time_domain_signals.png")
         logger.info("  Saved time-domain signals")
-        plot_fft_spectra(dataset_dir, plots_dir / "02_fft_spectra.png")
+        plot_fft_spectra(
+            dataset_dir, plots_dir / "02_fft_spectra.png",
+            **proc_kwargs,
+        )
         logger.info("  Saved FFT spectra")
+        plot_fft_full_audio(
+            dataset_dir, plots_dir / "02b_fft_full_audio.png",
+            **proc_kwargs,
+        )
+        logger.info("  Saved full-audio FFT spectra")
         plot_word_vectors(
-            dataset_dir, plots_dir / "03_word_vector_maps.png", dwv_low, dwv_high
+            dataset_dir, plots_dir / "03_word_vector_maps.png", dwv_low, dwv_high,
+            **proc_kwargs,
         )
         logger.info("  Saved word vector maps")
         plot_acoustic_images(
-            dataset_dir, plots_dir / "04_acoustic_images.png", dwv_low, dwv_high
+            dataset_dir, plots_dir / "04_acoustic_images.png", dwv_low, dwv_high,
+            matrix_size=args.matrix_size, **proc_kwargs,
         )
         logger.info("  Saved acoustic images")
 
@@ -605,11 +863,19 @@ def main():
 
     image_dir = Path(args.image_dir)
     if not image_dir.exists():
-        logger.error(
-            "Image directory not found: %s  –  run paper1_pipeline.py first.",
+        logger.info(
+            "Image directory not found: %s – auto-generating from dataset...",
             image_dir,
         )
-        sys.exit(1)
+        image_dir.mkdir(parents=True, exist_ok=True)
+        ok = _run_pipeline(
+            image_dir, args.dataset_dir, dwv_low, dwv_high,
+            args.matrix_size, args.output_size,
+            **proc_kwargs,
+        )
+        if not ok:
+            logger.error("Auto-generation failed")
+            sys.exit(1)
 
     eval_ds = datasets.ImageFolder(str(image_dir), transform=get_transforms(False))
     train_ds = datasets.ImageFolder(str(image_dir), transform=get_transforms(True))
@@ -624,18 +890,27 @@ def main():
         class_names,
     )
 
-    train_idx, test_idx = split_dataset(targets, args.test_size, args.seed)
+    train_idx, val_idx, test_idx = split_dataset(
+        targets, args.test_size, args.val_size, args.seed
+    )
     logger.info(
-        "Split: %d train, %d test (%.0f%% test)",
-        len(train_idx),
-        len(test_idx),
-        args.test_size * 100,
+        "Split: %d train, %d val, %d test (%.0f%%/%.0f%%/%.0f%%)",
+        len(train_idx), len(val_idx), len(test_idx),
+        100 * len(train_idx) / len(targets),
+        100 * len(val_idx) / len(targets),
+        100 * len(test_idx) / len(targets),
     )
 
     train_loader = DataLoader(
         Subset(train_ds, train_idx),
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        Subset(eval_ds, val_idx),
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=0,
     )
     test_loader = DataLoader(
@@ -662,7 +937,7 @@ def main():
         model, history = train_and_evaluate(
             model_name,
             train_loader,
-            test_loader,
+            val_loader,
             num_classes,
             args.epochs,
             args.lr,
@@ -679,19 +954,25 @@ def main():
         )
 
         criterion = nn.CrossEntropyLoss()
-        _, er, mer, cm = evaluate_model(model, test_loader, criterion, device)
+        _, val_er, val_mer, _ = evaluate_model(model, val_loader, criterion, device)
+        _, test_er, test_mer, test_cm = evaluate_model(model, test_loader, criterion, device)
         plot_confusion_matrix(
-            cm, class_names, model_name, results_dir / f"{model_name}_confusion.png"
+            test_cm, class_names, model_name, results_dir / f"{model_name}_confusion.png"
         )
 
         all_results[model_name] = {
-            "er": er,
-            "mer": mer,
-            "cm": cm,
+            "val_er": val_er,
+            "val_mer": val_mer,
+            "test_er": test_er,
+            "test_mer": test_mer,
+            "cm": test_cm,
             "history": history,
         }
 
-        logger.info("[%s] Final — ER: %.1f%%   MER: %.1f%%", model_name, er, mer)
+        logger.info(
+            "[%s] Final — Val ER: %.1f%%  Val MER: %.1f%%  |  Test ER: %.1f%%  Test MER: %.1f%%",
+            model_name, val_er, val_mer, test_er, test_mer,
+        )
 
     # ------------------------------------------------------------------
     # K-fold cross-validation
@@ -718,25 +999,32 @@ def main():
                 args.batch_size,
                 device,
                 args.seed,
+                val_fraction=args.val_size,
             )
 
-            ers = [f["er"] for f in folds]
-            mers = [f["mer"] for f in folds]
-            kfold_results[model_name] = {"ers": ers, "mers": mers, "folds": folds}
+            test_ers = [f["test_er"] for f in folds]
+            test_mers = [f["test_mer"] for f in folds]
+            val_ers = [f["val_er"] for f in folds]
+            val_mers = [f["val_mer"] for f in folds]
+            kfold_results[model_name] = {
+                "test_ers": test_ers, "test_mers": test_mers,
+                "val_ers": val_ers, "val_mers": val_mers,
+                "folds": folds,
+            }
 
             logger.info(
-                "[%s] K-fold  ER: %.1f ± %.1f%%   MER: %.1f ± %.1f%%",
+                "[%s] K-fold  Val ER: %.1f ± %.1f%%  |  Test ER: %.1f ± %.1f%%",
                 model_name,
-                np.mean(ers),
-                np.std(ers),
-                np.mean(mers),
-                np.std(mers),
+                np.mean(val_ers), np.std(val_ers),
+                np.mean(test_ers), np.std(test_ers),
             )
 
             np.savez(
                 kf_dir / f"{model_name}_kfold.npz",
-                ers=np.array(ers),
-                mers=np.array(mers),
+                test_ers=np.array(test_ers),
+                test_mers=np.array(test_mers),
+                val_ers=np.array(val_ers),
+                val_mers=np.array(val_mers),
             )
 
     # ------------------------------------------------------------------
@@ -748,8 +1036,12 @@ def main():
         fh.write("=" * 50 + "\n\n")
         fh.write(f"Classes ({num_classes}): {class_names}\n")
         fh.write(f"Total images: {len(eval_ds)}\n")
-        fh.write(f"Train/test split: {args.test_size*100:.0f}% test (Stratified)\n")
-        fh.write(f"  Train: {len(train_idx)}   Test: {len(test_idx)}\n")
+        fh.write(
+            f"Train/Val/Test split: {len(train_idx)}/{len(val_idx)}/{len(test_idx)} "
+            f"({100*len(train_idx)/len(targets):.0f}%/"
+            f"{100*len(val_idx)/len(targets):.0f}%/"
+            f"{100*len(test_idx)/len(targets):.0f}%)\n"
+        )
         fh.write(
             f"Epochs: {args.epochs}   LR: {args.lr}   Batch: {args.batch_size}\n\n"
         )
@@ -759,7 +1051,10 @@ def main():
         fh.write("-" * 50 + "\n")
         for mn in args.models:
             r = all_results[mn]
-            fh.write(f"  {mn:20s}  ER = {r['er']:6.1f}%   MER = {r['mer']:6.1f}%\n")
+            fh.write(
+                f"  {mn:20s}  Val ER = {r['val_er']:5.1f}%  Val MER = {r['val_mer']:5.1f}%"
+                f"  |  Test ER = {r['test_er']:5.1f}%  Test MER = {r['test_mer']:5.1f}%\n"
+            )
 
         if kfold_results:
             fh.write("\n" + "-" * 50 + "\n")
@@ -768,31 +1063,29 @@ def main():
             for mn in args.models:
                 kr = kfold_results[mn]
                 fh.write(
-                    f"  {mn:20s}  ER = {np.mean(kr['ers']):5.1f} ± {np.std(kr['ers']):4.1f}%"
-                    f"   MER = {np.mean(kr['mers']):5.1f} ± {np.std(kr['mers']):4.1f}%\n"
+                    f"  {mn:20s}  Val ER = {np.mean(kr['val_ers']):5.1f} ± {np.std(kr['val_ers']):4.1f}%"
+                    f"  |  Test ER = {np.mean(kr['test_ers']):5.1f} ± {np.std(kr['test_ers']):4.1f}%\n"
                 )
 
     logger.info("Summary report saved to %s", report_path)
 
-    # Print final summary block for experiment tracking
     best_model_name = ""
-    best_er = -1
+    best_test_er = -1
     for mn, res in all_results.items():
-        if res["er"] > best_er:
-            best_er = res["er"]
+        if res["test_er"] > best_test_er:
+            best_test_er = res["test_er"]
             best_model_name = mn
 
     if best_model_name:
         res = all_results[best_model_name]
-        # Estimate params (very rough or just use a dummy for now if not easy)
-        # For simplicity, we can get it from the model
         model = create_model(best_model_name, num_classes)
         num_params = sum(p.numel() for p in model.parameters()) / 1e6
 
         print("\n---")
-        print(f"val_acc:          {res['er']/100.0:.4f}  (ER)")
-        print(f"mer:              {res['mer']/100.0:.4f}  (MER)")
-        # We don't have total time easily here without wrapping the loop, but we can estimate
+        print(f"val_acc:          {res['val_er']/100.0:.4f}  (Val ER)")
+        print(f"val_mer:          {res['val_mer']/100.0:.4f}  (Val MER)")
+        print(f"test_acc:         {res['test_er']/100.0:.4f}  (Test ER)")
+        print(f"test_mer:         {res['test_mer']/100.0:.4f}  (Test MER)")
         print(f"num_params_M:     {num_params:.1f}")
         print(f"best_model:       {best_model_name}")
         print("---")
